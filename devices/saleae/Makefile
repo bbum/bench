@@ -3,10 +3,29 @@ BINDIR ?= $(PREFIX)/bin
 CONFIG ?= release
 GENERATED := Sources/sal/Generated
 
-.PHONY: build install proto clean
+.PHONY: build test verify coverage mutation install proto clean
 
 build:
 	swift build -c $(CONFIG)
+
+test:
+	swift test
+
+# End-to-end check against real hardware. Needs Logic 2 and the testgen board.
+verify:
+	SAL_LIVE=1 swift test --filter LiveTests
+
+# Injects bugs one at a time and requires the offline tests to catch each one.
+mutation:
+	python3 -I tools/mutation_test.py
+
+# Region coverage of hand-written code, including the live tests.
+coverage:
+	SAL_LIVE=1 swift test --enable-code-coverage
+	xcrun llvm-cov report \
+		.build/debug/salTests.xctest/Contents/MacOS/salTests \
+		-instr-profile=.build/debug/codecov/default.profdata \
+		-ignore-filename-regex='(\.build|Generated|Tests)/'
 
 install: build
 	@mkdir -p $(BINDIR)

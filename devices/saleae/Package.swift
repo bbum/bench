@@ -25,5 +25,12 @@ let package = Package(
                 .product(name: "GRPCProtobuf", package: "grpc-swift-protobuf"),
             ]
         ),
+        .testTarget(
+            name: "salTests",
+            dependencies: ["sal"],
+            resources: [
+                .copy("Fixtures"),
+            ]
+        ),
     ]
 )

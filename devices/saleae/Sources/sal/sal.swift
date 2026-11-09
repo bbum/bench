@@ -16,7 +16,7 @@ struct Sal: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "sal",
         abstract: "Drive Saleae logic analyzers through Logic 2's automation server.",
-        subcommands: [Status.self]
+        subcommands: [Status.self, CaptureCommand.self]
     )
 }
 
@@ -34,16 +34,18 @@ struct Status: AsyncParsableCommand {
 
         try await withLogic2(logic2.endpoint) { manager in
             let app = try await manager.getAppInfo(.init(), options: callOptions).appInfo
-            let api = app.apiVersion
-            print("Logic \(app.applicationVersion), API \(api.major).\(api.minor).\(api.patch)")
-
             let devices = try await manager.getDevices(.init(), options: callOptions).devices
-            if devices.isEmpty {
-                print("No devices connected")
-            }
-            for device in devices {
-                print("\(device.deviceType) \(device.deviceID)")
-            }
+            statusLines(app: app, devices: devices).forEach { print($0) }
         }
     }
+}
+
+func statusLines(
+    app: Saleae_Automation_AppInfo,
+    devices: [Saleae_Automation_Device]
+) -> [String] {
+    let api = app.apiVersion
+    let header = "Logic \(app.applicationVersion), API \(api.major).\(api.minor).\(api.patch)"
+    guard !devices.isEmpty else { return [header, "No devices connected"] }
+    return [header] + devices.map { "\($0.deviceType) \($0.deviceID)" }
 }
