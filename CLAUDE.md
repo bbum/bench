@@ -7,6 +7,6 @@ Each vendor directory is self-contained, with its own build and docs.
 | Directory         | Hardware                  | Status                                        |
 |-------------------|---------------------------|-----------------------------------------------|
 | `devices/owon/`   | Owon SDS-series scopes    | Working `ow` CLI + MCP server. See its CLAUDE.md. |
-| `devices/saleae/` | Saleae logic analyzers    | Not started. Logic Pro 8 is first.            |
+| `devices/saleae/` | Saleae logic analyzers    | Early `sal` CLI over Logic 2 gRPC. See its CLAUDE.md. |
 
 Run build and test commands from the vendor directory, not the repo root.

@@ -1,0 +1,49 @@
+import ArgumentParser
+import GRPCCore
+
+struct Logic2Options: ParsableArguments {
+    @Option(help: "Logic 2 automation server address.")
+    var host = "127.0.0.1"
+
+    @Option(help: "Logic 2 automation server port.")
+    var port = 10430
+
+    var endpoint: Logic2Endpoint { Logic2Endpoint(host: host, port: port) }
+}
+
+@main
+struct Sal: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "sal",
+        abstract: "Drive Saleae logic analyzers through Logic 2's automation server.",
+        subcommands: [Status.self]
+    )
+}
+
+struct Status: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        abstract: "Show the Logic 2 version and connected devices."
+    )
+
+    @OptionGroup var logic2: Logic2Options
+
+    func run() async throws {
+        var options = CallOptions.defaults
+        options.timeout = .seconds(5)
+        let callOptions = options
+
+        try await withLogic2(logic2.endpoint) { manager in
+            let app = try await manager.getAppInfo(.init(), options: callOptions).appInfo
+            let api = app.apiVersion
+            print("Logic \(app.applicationVersion), API \(api.major).\(api.minor).\(api.patch)")
+
+            let devices = try await manager.getDevices(.init(), options: callOptions).devices
+            if devices.isEmpty {
+                print("No devices connected")
+            }
+            for device in devices {
+                print("\(device.deviceType) \(device.deviceID)")
+            }
+        }
+    }
+}

@@ -1,0 +1,7 @@
+directories:
+  data: arduino/data
+  downloads: arduino/downloads
+  user: arduino/user
+board_manager:
+  additional_urls:
+    - https://arduino.esp8266.com/stable/package_esp8266com_index.json
