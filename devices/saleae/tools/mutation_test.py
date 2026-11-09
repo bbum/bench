@@ -22,6 +22,7 @@ DECODERS = ROOT / "Logic2/Decoders.swift"
 DECODE = ROOT / "Subcommands/DecodeCommand.swift"
 MODE = ROOT / "Logic2/CaptureMode.swift"
 OPTIONS = ROOT / "Subcommands/CaptureOptions.swift"
+IDENTIFY = ROOT / "Analysis/ChannelIdentification.swift"
 
 MUTANTS = [
     (CHANNEL, "guard version == 0 else", "guard version >= 0 else"),
@@ -103,10 +104,26 @@ MUTANTS = [
     (DECODERS, 'case 1: "1 Bit per Transfer"', 'case 1: "1 Bits per Transfer"'),
     (DECODERS, "wordBits: ClosedRange<Int> = 1...64", "wordBits: ClosedRange<Int> = 1...65"),
     (DECODERS, "[i2c.sda, i2c.scl].sorted()", "[i2c.sda, i2c.scl]"),
-    (CAPTURE, "analyzer.radixType = request.radix.type", "analyzer.radixType = .hexadecimal"),
+    (CAPTURE, "analyzer.radixType = radix.type", "analyzer.radixType = .hexadecimal"),
     (DECODE, "guard baud > 0", "guard baud >= 0"),
     (DECODE, "guard limit > 0", "guard limit >= 0"),
     (DECODE, "guard offset >= 0", "guard offset > 0"),
+    (IDENTIFY, "let byteClocks = clocks - 1", "let byteClocks = clocks"),
+    (IDENTIFY, "byteClocks.isMultiple(of: 9)", "byteClocks.isMultiple(of: 8)"),
+    (IDENTIFY, "(edges / 2).isMultiple(of: 8)", "(edges / 2).isMultiple(of: 7)"),
+    (IDENTIFY, "dataOnTrailingEdge: leading > trailing", "dataOnTrailingEdge: leading < trailing"),
+    (IDENTIFY, "clockIdlesHigh: clock.restingLevel == 1", "clockIdlesHigh: clock.restingLevel == 0"),
+    (IDENTIFY, "decoder.enableActiveHigh = level == 1", "decoder.enableActiveHigh = level == 0"),
+    (IDENTIFY, "inverted: resting == 0", "inverted: resting == 1"),
+    (IDENTIFY, "guard whole <= longestActiveBits else { return nil }", ""),
+    (IDENTIFY, "if candidate.level(afterEdges: index + 1) == resting {", "if false {"),
+    (IDENTIFY, "for _ in 0..<3 {", "for _ in 0..<0 {"),
+    (IDENTIFY, "sorted[first] * 1.35", "sorted[first] * 1.01"),
+    (IDENTIFY, "$0.summary.initialLevel == 1 }", "false }"),
+    (CAPTURE, "for inverted in [uart.inverted, !uart.inverted]", "for inverted in [uart.inverted]"),
+    (CAPTURE, "for parity in Parity.allCases", "for parity in [Parity.none]"),
+    (CAPTURE, "rows.dropFirst(start).dropLast()", "rows.dropFirst(start)"),
+    (CAPTURE, "13 / Double(baud)", "1 / Double(baud)"),
     (MAIN, "guard !devices.isEmpty else", "guard devices.isEmpty else"),
 ]
 

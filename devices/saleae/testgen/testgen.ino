@@ -23,9 +23,10 @@ static const uint8_t I2C_FRAME[] = {0xDE, 0xAD, 0xBE, 0xEF};
 static const uint32_t I2C_HALF_PERIOD_US = 5;
 static const uint32_t CYCLE_GAP_MS = 20;
 
-static const uint32_t UART_BIT_CYCLES = F_CPU / 115200;
+static const uint32_t DEFAULT_UART_BIT_CYCLES = F_CPU / 115200;
+static uint32_t uartBitCycles = DEFAULT_UART_BIT_CYCLES;
 
-enum Fault { FAULT_NONE, FAULT_FRAMING_AND_NACK, FAULT_PARITY };
+enum Fault { FAULT_NONE, FAULT_FRAMING_AND_NACK, FAULT_PARITY, FAULT_RANDOM };
 
 struct UartFormat {
   uint8_t bits;
@@ -66,6 +67,11 @@ static const Variant VARIANTS[] = {
     {'f', FORMAT_8N1, FORMAT_SPI_DEFAULT, FAULT_FRAMING_AND_NACK},
     {'p', {8, 'E', 2, false, false}, FORMAT_SPI_DEFAULT, FAULT_PARITY},
 };
+
+static const uint32_t STANDARD_BAUDS[] = {1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800};
+static const size_t RANDOM_PAYLOAD_SIZE = 32;
+static uint8_t randomPayload[RANDOM_PAYLOAD_SIZE];
+static Variant randomVariant = {'r', FORMAT_8N1, FORMAT_SPI_DEFAULT, FAULT_RANDOM};
 
 static const Variant *activeVariant = nullptr;
 
@@ -158,19 +164,19 @@ static void IRAM_ATTR uartLevel(const UartFormat &format, bool level, uint32_t &
 static void IRAM_ATTR uartFrame(const UartFormat &format, uint16_t value, bool goodStop = true, bool goodParity = true) {
   noInterrupts();
   uint32_t deadline = ESP.getCycleCount();
-  uartLevel(format, false, deadline, UART_BIT_CYCLES);
+  uartLevel(format, false, deadline, uartBitCycles);
   uint8_t ones = 0;
   for (uint8_t i = 0; i < format.bits; i++) {
     uint8_t index = format.msbFirst ? format.bits - 1 - i : i;
     bool bit = (value >> index) & 1;
     ones += bit;
-    uartLevel(format, bit, deadline, UART_BIT_CYCLES);
+    uartLevel(format, bit, deadline, uartBitCycles);
   }
   if (format.parity != 'N') {
     bool parity = ((ones & 1) != 0) != (format.parity == 'O');
-    uartLevel(format, parity == goodParity, deadline, UART_BIT_CYCLES);
+    uartLevel(format, parity == goodParity, deadline, uartBitCycles);
   }
-  uartLevel(format, goodStop, deadline, UART_BIT_CYCLES * format.stopHalves / 2);
+  uartLevel(format, goodStop, deadline, uartBitCycles * format.stopHalves / 2);
   uartPin(!format.inverted);
   interrupts();
   delayMicroseconds(30);
@@ -183,6 +189,10 @@ static void sendVariantUART(const Variant &variant) {
     uartFrame(format, 0x42, false);
     delayMicroseconds(100);
     uartFrame(format, 0x43);
+  } else if (variant.fault == FAULT_RANDOM) {
+    for (uint8_t value : randomPayload) {
+      uartFrame(format, value);
+    }
   } else if (variant.fault == FAULT_PARITY) {
     uartFrame(format, 0x44);
     uartFrame(format, 0x45, true, false);
@@ -252,7 +262,34 @@ static void useVariant(const Variant &variant) {
   pinMode(SPI_PIN_MOSI, OUTPUT);
   pinMode(SPI_PIN_CS, OUTPUT);
   digitalWrite(SPI_PIN_CS, variant.spi.csActiveHigh ? LOW : HIGH);
+  uartBitCycles = DEFAULT_UART_BIT_CYCLES;
   activeVariant = &variant;
+}
+
+// Picks a baud rate, format and payload, then reports them so a test can check what a
+// blind analysis of the wires concludes. Half the rates are not standard ones.
+static void useRandomUart(bool fastest) {
+  uint32_t baud = fastest
+                      ? 921600
+                      : (ESP.random() & 1)
+                      ? STANDARD_BAUDS[ESP.random() % (sizeof(STANDARD_BAUDS) / sizeof(STANDARD_BAUDS[0]))]
+                      : static_cast<uint32_t>(2400.0 * pow(2.0, (ESP.random() % 770) / 100.0));
+  static const char PARITIES[] = {'N', 'E', 'O'};
+  randomVariant.uart.parity = PARITIES[ESP.random() % 3];
+  randomVariant.uart.stopHalves = (ESP.random() & 1) ? 4 : 2;
+  randomVariant.uart.inverted = ESP.random() & 1;
+  for (uint8_t &value : randomPayload) {
+    value = ESP.random() & 0xFF;
+  }
+  useVariant(randomVariant);
+  uartBitCycles = F_CPU / baud;
+
+  Serial.printf("random baud=%u parity=%c stop=%u inverted=%u data=", baud, randomVariant.uart.parity,
+                randomVariant.uart.stopHalves / 2, randomVariant.uart.inverted ? 1 : 0);
+  for (uint8_t value : randomPayload) {
+    Serial.printf("%02X", value);
+  }
+  Serial.println();
 }
 
 static void handleCommands() {
@@ -264,6 +301,12 @@ static void handleCommands() {
       pinMode(PIN_PWM, OUTPUT);
       analogWrite(PIN_PWM, 250);
       Serial.println("mode c");
+      continue;
+    }
+    if (key == 'r' || key == 'R') {
+      useRandomUart(key == 'R');
+      Serial.print("mode ");
+      Serial.println(key);
       continue;
     }
     for (const Variant &variant : VARIANTS) {
@@ -302,7 +345,7 @@ void setup() {
   analogWrite(PIN_PWM, 250);
 
   Serial.println();
-  Serial.println("testgen v2 running");
+  Serial.println("testgen v3 running");
 }
 
 void loop() {

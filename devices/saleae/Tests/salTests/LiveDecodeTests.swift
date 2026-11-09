@@ -8,11 +8,49 @@ private let uart = UARTDecoder(channel: 2, baud: 115_200)
 private let spi = SPIDecoder(clock: 3, mosi: 4, enable: 5)
 private let i2c = I2CDecoder(sda: 6, scl: 7)
 
-private func decode(_ decoder: ProtocolDecoder, radix: Radix = .hex) async throws -> [DecodedRow] {
+private struct RandomUART: CustomStringConvertible {
+    var baud: Int
+    var parity: Parity
+    var inverted: Bool
+    var payload: [UInt8]
+    var description: String { "baud \(baud), \(parity), inverted \(inverted)" }
+
+    /// Parses `random baud=57600 parity=E stop=2 inverted=1 data=<hex>`.
+    init?(reply: String) {
+        guard let line = reply.split(whereSeparator: \.isNewline).first(where: { $0.hasPrefix("random ") }) else {
+            return nil
+        }
+        var fields: [Substring: Substring] = [:]
+        for field in line.split(separator: " ").dropFirst() {
+            let parts = field.split(separator: "=")
+            guard parts.count == 2 else { return nil }
+            fields[parts[0]] = parts[1]
+        }
+        guard let baud = fields["baud"].flatMap({ Int($0) }), let inverted = fields["inverted"], let data = fields["data"]
+        else {
+            return nil
+        }
+        self.baud = baud
+        parity = fields["parity"] == "E" ? .even : fields["parity"] == "O" ? .odd : .none
+        self.inverted = inverted == "1"
+        let digits = Array(data)
+        payload = stride(from: 0, to: digits.count - 1, by: 2).compactMap { UInt8(String(digits[$0...($0 + 1)]), radix: 16) }
+    }
+}
+
+private func identify(seconds: Double = 0.2) async throws -> ChannelIdentification {
+    try await runIdentify(
+        DigitalCaptureRequest(
+            channels: Array(0...7), sampleRate: 50_000_000, mode: .timed(seconds: seconds), levelVolts: 3.3,
+            deviceID: nil),
+        confirm: true, endpoint: Logic2Endpoint())
+}
+
+private func decode(_ decoder: ProtocolDecoder, radix: Radix = .hex, seconds: Double = 0.12) async throws -> [DecodedRow] {
     try await runDecode(
         DecodeRequest(
             capture: DigitalCaptureRequest(
-                channels: decoder.channels, sampleRate: 50_000_000, mode: .timed(seconds: 0.12), levelVolts: 3.3,
+                channels: decoder.channels, sampleRate: 50_000_000, mode: .timed(seconds: seconds), levelVolts: 3.3,
                 deviceID: nil),
             decoder: decoder, radix: radix),
         endpoint: Logic2Endpoint())
@@ -397,6 +435,68 @@ extension LiveTests {
             "--channels", "1,2", "--trigger", "1:rising", "--duration", "0.05", "--glitch", "2:1us",
         ]) as! CaptureCommand
         try await command.run()
+    }
+
+    @Test("The clean testgen traffic is identified and confirmed")
+    func identifyClean() async throws {
+        let result = try await withTestgen(mode: "c") { try await identify() }
+        #expect(result.buses.map(\.decoder) == [
+            .uart(uart), .spi(SPIDecoder(clock: 3, mosi: 4, enable: 5)), .i2c(i2c),
+        ])
+        #expect(result.buses.allSatisfy { $0.confidence == .confirmed })
+        #expect(result.periodic.map(\.channel) == [0, 1])
+        #expect(result.unknown.isEmpty)
+    }
+
+    @Test("Format and SPI mode are worked out from the wires", arguments: [
+        ("a", false, true, false, Parity.none),
+        ("b", true, false, false, .even),
+        ("d", true, true, false, .odd),
+        ("h", false, false, true, .none),
+    ] as [(Character, Bool, Bool, Bool, Parity)])
+    func identifyFormats(mode: Character, cpol: Bool, cpha: Bool, activeHigh: Bool, parity: Parity) async throws {
+        try await withTestgen(mode: mode) {
+            let result = try await identify()
+            let spi = try #require(result.buses.compactMap { bus -> SPIDecoder? in
+                if case .spi(let spi) = bus.decoder { spi } else { nil }
+            }.first)
+            #expect(spi == SPIDecoder(
+                clock: 3, mosi: 4, enable: 5, clockIdlesHigh: cpol, dataOnTrailingEdge: cpha, enableActiveHigh: activeHigh))
+
+            let serial = try #require(result.buses.compactMap { bus -> UARTDecoder? in
+                if case .uart(let serial) = bus.decoder { serial } else { nil }
+            }.first)
+            #expect(serial.channel == 2)
+            #expect(serial.baud == 115_200)
+            #expect(serial.inverted == (mode == "h"))
+            if mode != "a" { #expect(serial.parity == parity) }
+        }
+    }
+
+    @Test("A random UART is worked out blind", arguments: Array(0..<12) + Array(100..<106))
+    func randomUART(run: Int) async throws {
+        // The later runs force the fastest rate, where the edges jitter most.
+        try await withTestgenReply(mode: run < 100 ? "r" : "R") { reply in
+            let truth = try #require(RandomUART(reply: reply), "\(reply)")
+            // Enough for several complete messages at this baud rate.
+            let seconds = max(0.2, 3 * Double(truth.payload.count) * 12 / Double(truth.baud))
+            let result = try await identify(seconds: seconds)
+
+            let bus = try #require(result.buses.first { $0.decoder.channels == [2] }, "\(truth)")
+            guard case .uart(let serial) = bus.decoder else {
+                Issue.record("not uart: \(truth)")
+                return
+            }
+            // At the forced top rate the bit-banged signal itself runs a few percent slow.
+            let tolerance = run < 100 ? 0.031 : 0.07
+            #expect(abs(Double(serial.baud) - Double(truth.baud)) <= Double(truth.baud) * tolerance, "\(serial.baud) vs \(truth)")
+            #expect(serial.inverted == truth.inverted, "\(truth)")
+            #expect(serial.parity == truth.parity, "\(truth)")
+            #expect(bus.confidence == .confirmed, "\(truth)")
+
+            let rows = try await decode(.uart(serial), seconds: seconds)
+            #expect(contains(rows.compactMap { word($0) }, truth.payload.map(UInt64.init)), "\(truth)")
+        }
     }
 
     @Test("The decode commands run in both output modes", arguments: [

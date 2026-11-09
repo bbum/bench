@@ -179,3 +179,54 @@ struct DecodeRequest: Sendable {
     var decoder: ProtocolDecoder
     var radix = Radix.hex
 }
+
+extension ProtocolDecoder {
+    var kind: String {
+        switch self {
+        case .uart: "uart"
+        case .spi: "spi"
+        case .i2c: "i2c"
+        }
+    }
+
+    var channelRoles: [String: UInt32] {
+        switch self {
+        case .uart(let uart): ["signal": uart.channel]
+        case .spi(let spi):
+            ["clock": spi.clock, "mosi": spi.mosi, "miso": spi.miso, "enable": spi.enable].compactMapValues { $0 }
+        case .i2c(let i2c): ["sda": i2c.sda, "scl": i2c.scl]
+        }
+    }
+
+    /// The `sal decode` command line for this decoder.
+    var command: String {
+        var parts = ["sal", "decode", kind]
+        func add(_ flag: String, _ value: String) { parts += [flag, value] }
+
+        switch self {
+        case .uart(let uart):
+            add("--channel", "\(uart.channel)")
+            add("--baud", "\(uart.baud)")
+            if uart.bits != 8 { add("--bits", "\(uart.bits)") }
+            if uart.parity != .none { add("--parity", uart.parity.rawValue) }
+            if uart.stop != .one { add("--stop", uart.stop.rawValue) }
+            if uart.order != .lsb { add("--order", uart.order.rawValue) }
+            if uart.inverted { parts.append("--inverted") }
+            if uart.mode != .normal { add("--mode", uart.mode.rawValue) }
+        case .spi(let spi):
+            add("--clock", "\(spi.clock)")
+            if let mosi = spi.mosi { add("--mosi", "\(mosi)") }
+            if let miso = spi.miso { add("--miso", "\(miso)") }
+            if let enable = spi.enable { add("--enable", "\(enable)") }
+            if spi.bits != 8 { add("--bits", "\(spi.bits)") }
+            if spi.order != .msb { add("--order", spi.order.rawValue) }
+            if spi.clockIdlesHigh { add("--cpol", "1") }
+            if spi.dataOnTrailingEdge { add("--cpha", "1") }
+            if spi.enableActiveHigh { parts.append("--enable-active-high") }
+        case .i2c(let i2c):
+            add("--sda", "\(i2c.sda)")
+            add("--scl", "\(i2c.scl)")
+        }
+        return parts.joined(separator: " ")
+    }
+}

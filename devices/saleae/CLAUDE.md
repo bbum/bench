@@ -5,13 +5,14 @@ a CLI today and will grow an MCP server. First target is the Logic Pro 8.
 
 Status: `sal status`, `sal capture` (digital capture with a per-channel summary) and
 `sal decode uart|spi|i2c` (decoded rows with paging and issue counts) work, with timed,
-manual and trigger captures and glitch filters. MCP is not built yet. See PLAN.md for the phases.
+manual and trigger captures and glitch filters. `sal identify` works out what is on
+each channel. MCP is not built yet. See PLAN.md for the phases.
 
 ## Build
 
 ```
 swift build
-make test        # offline, uses a recorded testgen capture
+make test        # offline, uses a recorded testgen capture; about 40 s
 make verify      # live end-to-end check; needs Logic 2 and testgen on USB
 make build       # release
 make install     # release -> ~/.local/bin/sal
@@ -74,6 +75,11 @@ Tested the way SQLite is. New parsing or analysis code ships with all of these:
   Never call it on a manual capture.
 - Reaching the buffer limit fails WaitCapture and CloseCapture. `make verify` does this
   on purpose, so a "Capture Stopped" dialog appearing in Logic 2 is expected.
+- `sal identify` limits, which it reports as notes: timing cannot show MOSI from MISO,
+  UART TX from RX, word size, stop bits or bit order, and idle lines show nothing.
+- UART pauses between frames can be any length, so only time away from idle has to be
+  whole bits. A capture opening mid-frame misdecodes until the next gap longer than a
+  frame, so confirmation ignores rows before that gap.
 - Adding an analyzer takes almost a second, so live tests should not add many.
 - The deployment target is macOS 27.0 because the current toolchain rejects 27.2.
 - Binary exports: this Logic Pro 8 on Logic 2.4.48 produces format V0 (confirmed by
@@ -81,5 +87,6 @@ Tested the way SQLite is. New parsing or analysis code ships with all of these:
   field and reject anything unknown.
 - `testgen/` is an ESP8266 known-answer signal source. Its README has the wiring, the
   expected values for each channel, and the modes selected over USB serial. Opening
-  the port resets the board, but closing it does not, so tests restore clean mode.
+  the port usually resets the board and closing it does not, so tests select a mode
+  and restore clean mode.
 - `proto/` is a verbatim copy of upstream. See `proto/UPSTREAM`.

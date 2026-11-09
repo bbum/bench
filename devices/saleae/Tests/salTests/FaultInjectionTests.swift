@@ -10,6 +10,7 @@ private actor FakeBackend: CaptureBackend {
     let failing: Set<Step>
     let hanging: Set<Step>
     let onEnter: @Sendable (Step) async -> Void
+    let tableProvider: (@Sendable (Saleae_Automation_AddAnalyzerRequest) -> Data)?
     let writeExport: @Sendable (URL) throws -> Void
     private(set) var calls: [Step] = []
     private(set) var closedIDs: [UInt64] = []
@@ -24,11 +25,13 @@ private actor FakeBackend: CaptureBackend {
         failing: Set<Step> = [],
         hanging: Set<Step> = [],
         onEnter: @escaping @Sendable (Step) async -> Void = { _ in },
+        tableProvider: (@Sendable (Saleae_Automation_AddAnalyzerRequest) -> Data)? = nil,
         writeExport: @escaping @Sendable (URL) throws -> Void = copyFixtures
     ) {
         self.failing = failing
         self.hanging = hanging
         self.onEnter = onEnter
+        self.tableProvider = tableProvider
         self.writeExport = writeExport
     }
 
@@ -68,7 +71,8 @@ private actor FakeBackend: CaptureBackend {
     func exportDataTable(_ request: Saleae_Automation_ExportDataTableCsvRequest) async throws {
         tableRequest = request
         try await record(.table)
-        try tableBytes.write(to: URL(fileURLWithPath: request.filepath))
+        let bytes = analyzerRequest.flatMap { tableProvider?($0) } ?? tableBytes
+        try bytes.write(to: URL(fileURLWithPath: request.filepath))
     }
 
     func setTable(_ bytes: Data) {
@@ -602,6 +606,159 @@ struct CaptureModeFlowTests {
                 #expect(await backend.closedIDs.count == (failing.contains(.start) ? 0 : 1), "failing: \(failing)")
             }
         }
+    }
+}
+
+private let uartRow = "\"a\",\"data\",1,0.5,,0x41\n"
+private let uartClean = "name,type,start_time,duration,\"error\",\"data\"\n" + String(repeating: uartRow, count: 3)
+private let uartFraming = "name,type,start_time,duration,\"error\",\"data\"\n"
+    + String(repeating: "\"a\",\"data\",1,0.5,\"framing\",0x41\n", count: 4)
+private let spiWords = "name,type,start_time,duration,\"mosi\"\n\"a\",\"result\",1,0.5,0xA5\n"
+private let i2cNack = "name,type,start_time,duration,\"address\",\"read\",\"ack\"\n\"a\",\"address\",1,0.5,0x42,false,false\n"
+private let emptyTable = "name,type,start_time,duration\n"
+
+@Suite("Identification confirmation")
+struct IdentifyConfirmationTests {
+    private func identify(
+        _ backend: FakeBackend,
+        confirm: Bool = true,
+        cancellation: CaptureCancellation = CaptureCancellation()
+    ) async throws -> ChannelIdentification {
+        let capture = request
+        return try await inTemporaryDirectory { directory in
+            try await exportIdentifiedCapture(
+                capture, confirm: confirm, in: directory, using: backend, cancellation: cancellation)
+        }
+    }
+
+    private func table(_ provider: @escaping @Sendable (String, String?) -> String)
+        -> @Sendable (Saleae_Automation_AddAnalyzerRequest) -> Data
+    {
+        { add in
+            var parity: String?
+            if case .stringValue(let value)? = add.settings["Parity Bit"]?.value { parity = value }
+            return Data(provider(add.analyzerName, parity).utf8)
+        }
+    }
+
+    private func standardTables(name: String, parity: String?) -> String {
+        switch name {
+        case "SPI": spiWords
+        case "I2C": i2cNack
+        default: uartClean
+        }
+    }
+
+    @Test("Every bus that decodes is confirmed, and the capture closes")
+    func allConfirmed() async throws {
+        let backend = FakeBackend(tableProvider: table(standardTables))
+        let result = try await identify(backend)
+        #expect(result.buses.map(\.confidence) == [.confirmed, .confirmed, .confirmed])
+        #expect(result.buses.map(\.decoder.kind) == ["uart", "spi", "i2c"])
+        #expect(await backend.closedIDs == [42])
+        #expect(await backend.calls.filter { $0 == .analyzer }.count == 3)
+    }
+
+    @Test("NACKs seen while confirming are reported")
+    func nacksNoted() async throws {
+        let backend = FakeBackend(tableProvider: table(standardTables))
+        let result = try await identify(backend)
+        #expect(result.buses[2].notes.contains("1 NACKs were seen."))
+    }
+
+    @Test("Without confirmation no decoder runs and buses stay likely")
+    func unconfirmed() async throws {
+        let backend = FakeBackend()
+        let result = try await identify(backend, confirm: false)
+        #expect(result.buses.map(\.confidence) == [.likely, .likely, .likely])
+        #expect(await backend.calls == [.start, .wait, .export, .close])
+    }
+
+    @Test("A parity is found when no-parity decoding reports errors")
+    func parityFound() async throws {
+        let backend = FakeBackend(tableProvider: table { name, parity in
+            guard name == "Async Serial" else { return self.standardTables(name: name, parity: parity) }
+            return parity == "Odd Parity Bit" ? uartClean : uartFraming
+        })
+        let result = try await identify(backend)
+        guard case .uart(let uart) = result.buses[0].decoder else {
+            Issue.record("not uart")
+            return
+        }
+        #expect(uart.parity == .odd)
+        #expect(result.buses[0].confidence == .confirmed)
+        #expect(result.buses[0].decoder.command.contains("--parity odd"))
+    }
+
+    @Test("The opposite polarity is tried when no parity decodes")
+    func polarityFound() async throws {
+        let backend = FakeBackend(tableProvider: { add in
+            guard add.analyzerName == "Async Serial" else {
+                return Data((add.analyzerName == "SPI" ? spiWords : i2cNack).utf8)
+            }
+            var inverted = false
+            if case .stringValue(let value)? = add.settings["Signal inversion"]?.value { inverted = value == "Inverted" }
+            return Data((inverted ? uartClean : uartFraming).utf8)
+        })
+        let result = try await identify(backend)
+        guard case .uart(let uart) = result.buses[0].decoder else {
+            Issue.record("not uart")
+            return
+        }
+        #expect(uart.inverted)
+        #expect(result.buses[0].confidence == .confirmed)
+    }
+
+    @Test("Errors at every parity leave the bus uncertain, with a note")
+    func noParityWorks() async throws {
+        let backend = FakeBackend(tableProvider: table { name, parity in
+            name == "Async Serial" ? uartFraming : self.standardTables(name: name, parity: parity)
+        })
+        let result = try await identify(backend)
+        #expect(result.buses[0].confidence == .uncertain)
+        #expect(result.buses[0].notes.last == "Decoding still reported 2 errors with each parity and polarity. Check the frame format.")
+        #expect(await backend.calls.filter { $0 == .analyzer }.count == 8)
+    }
+
+    @Test("A cut-off first and last frame do not count as errors")
+    func windowEdges() async throws {
+        let cut = "name,type,start_time,duration,\"error\",\"data\"\n"
+            + "\"a\",\"data\",1,0.5,\"framing\",0x41\n" + uartRow + "\"a\",\"data\",1,0.5,\"framing\",0x41\n"
+        let backend = FakeBackend(tableProvider: table { name, parity in
+            name == "Async Serial" ? cut : self.standardTables(name: name, parity: parity)
+        })
+        #expect(try await identify(backend).buses[0].confidence == .confirmed)
+    }
+
+    @Test("A decoder that finds nothing leaves the bus uncertain, with a note", arguments: [
+        ("Async Serial", 0, "Decoding still reported 0 errors with each parity and polarity. Check the frame format."),
+        ("SPI", 1, "Logic 2 decoded no SPI words."),
+        ("I2C", 2, "Logic 2 decoded no I2C addresses."),
+    ])
+    func decoderFindsNothing(analyzer: String, index: Int, note: String) async throws {
+        let backend = FakeBackend(tableProvider: table { name, parity in
+            name == analyzer ? emptyTable : self.standardTables(name: name, parity: parity)
+        })
+        let result = try await identify(backend)
+        #expect(result.buses[index].confidence == .uncertain)
+        #expect(result.buses[index].notes.last == note)
+    }
+
+    @Test("A failing analyzer fails the identification and still closes")
+    func analyzerFails() async {
+        let backend = FakeBackend(failing: [.analyzer])
+        await #expect(throws: InjectedFault.self) { try await identify(backend) }
+        #expect(await backend.closedIDs == [42])
+    }
+
+    @Test("Cancelling between buses stops confirming")
+    func cancelled() async {
+        let cancellation = CaptureCancellation()
+        let backend = FakeBackend(
+            onEnter: { if $0 == .table { cancellation.cancel() } }, tableProvider: table(standardTables))
+        await #expect(throws: CancellationError.self) { try await identify(backend, cancellation: cancellation) }
+        #expect(await backend.calls.filter { $0 == .analyzer }.count == 1)
+        #expect(await backend.closedIDs == [42])
     }
 }
 

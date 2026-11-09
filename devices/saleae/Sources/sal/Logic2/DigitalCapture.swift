@@ -116,7 +116,7 @@ func decodedCapture(export: (URL) async throws -> Void) async throws -> [Decoded
 }
 
 /// Exports never outlive this call.
-private func inTemporaryDirectory<Result>(_ body: (URL) async throws -> Result) async throws -> Result {
+func inTemporaryDirectory<Result>(_ body: (URL) async throws -> Result) async throws -> Result {
     let directory = FileManager.default.temporaryDirectory
         .appendingPathComponent("sal-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -133,14 +133,142 @@ func exportDigitalCapture(
     cancellation: CaptureCancellation
 ) async throws {
     try await runCapture(request, using: backend, cancellation: cancellation) { captureID in
-        var export = Saleae_Automation_ExportRawDataBinaryRequest()
-        export.captureID = captureID
-        export.directory = directory.path
-        export.logicChannels = request.logicChannels
-        // The server requires this even for digital-only exports.
-        export.analogDownsampleRatio = 1
-        try await backend.exportBinary(export)
+        try await exportBinary(request, captureID: captureID, to: directory, using: backend)
     }
+}
+
+private func exportBinary(
+    _ request: DigitalCaptureRequest,
+    captureID: UInt64,
+    to directory: URL,
+    using backend: some CaptureBackend
+) async throws {
+    var export = Saleae_Automation_ExportRawDataBinaryRequest()
+    export.captureID = captureID
+    export.directory = directory.path
+    export.logicChannels = request.logicChannels
+    // The server requires this even for digital-only exports.
+    export.analogDownsampleRatio = 1
+    try await backend.exportBinary(export)
+}
+
+/// Runs a capture, identifies what is on each channel from its timing, and optionally
+/// confirms each bus by decoding the same capture.
+func exportIdentifiedCapture(
+    _ request: DigitalCaptureRequest,
+    confirm: Bool,
+    in directory: URL,
+    using backend: some CaptureBackend,
+    cancellation: CaptureCancellation
+) async throws -> ChannelIdentification {
+    var result: ChannelIdentification?
+    try await runCapture(request, using: backend, cancellation: cancellation) { captureID in
+        try await exportBinary(request, captureID: captureID, to: directory, using: backend)
+        var identification = identifyChannels(try loadChannels(directory: directory, channels: request.channels))
+        if confirm {
+            for index in identification.buses.indices {
+                try cancellation.checkCancelled()
+                identification.buses[index] = try await confirmed(
+                    identification.buses[index], captureID: captureID, in: directory, using: backend)
+            }
+        }
+        result = identification
+    }
+    return result!
+}
+
+func runIdentify(
+    _ request: DigitalCaptureRequest,
+    confirm: Bool,
+    endpoint: Logic2Endpoint
+) async throws -> ChannelIdentification {
+    try await withCaptureCancellation { cancellation in
+        try await inTemporaryDirectory { directory in
+            try await withLogic2(endpoint) { manager in
+                try await exportIdentifiedCapture(
+                    request, confirm: confirm, in: directory, using: GRPCCaptureBackend(manager: manager),
+                    cancellation: cancellation)
+            }
+        }
+    }
+}
+
+func loadChannels(directory: URL, channels: [UInt32]) throws -> [IdentifiableChannel] {
+    try channels.map { channel in
+        let digital = try DigitalChannel(
+            contentsOf: directory.appendingPathComponent("digital_\(channel).bin"))
+        let times = digital.withEdgeTimes { edges in (0..<edges.count).map { edges[$0] } }
+        return IdentifiableChannel(summary: summarize(digital, channel: channel), times: times)
+    }
+}
+
+/// Decodes a capture already held by Logic 2.
+private func decodedRows(
+    _ decoder: ProtocolDecoder,
+    captureID: UInt64,
+    in directory: URL,
+    using backend: some CaptureBackend
+) async throws -> [DecodedRow] {
+    let file = directory.appendingPathComponent("confirm-\(UUID().uuidString).csv")
+    try await exportDataTable(
+        decoder, radix: .hex, captureID: captureID, to: file, using: backend)
+    return try decodedRows(fromCSV: Data(contentsOf: file))
+}
+
+/// Tries the bus's decoder on the capture. UART timing cannot show parity, or polarity
+/// on a line with no idle gap, so the alternatives are tried when decoding reports errors.
+private func confirmed(
+    _ bus: IdentifiedBus,
+    captureID: UInt64,
+    in directory: URL,
+    using backend: some CaptureBackend
+) async throws -> IdentifiedBus {
+    var bus = bus
+    switch bus.decoder {
+    case .uart(let uart):
+        var lastErrors = 0
+        for inverted in [uart.inverted, !uart.inverted] {
+            for parity in Parity.allCases {
+                var attempt = uart
+                attempt.parity = parity
+                attempt.inverted = inverted
+                let rows = try await decodedRows(.uart(attempt), captureID: captureID, in: directory, using: backend)
+                let errors = decodeIssues(alignedFrames(rows, baud: uart.baud)).values.reduce(0, +)
+                if !rows.isEmpty, errors == 0 {
+                    bus.decoder = .uart(attempt)
+                    bus.confidence = .confirmed
+                    return bus
+                }
+                lastErrors = errors
+            }
+        }
+        bus.confidence = .uncertain
+        bus.notes.append("Decoding still reported \(lastErrors) errors with each parity and polarity. Check the frame format.")
+    case .spi:
+        let rows = try await decodedRows(bus.decoder, captureID: captureID, in: directory, using: backend)
+        confirm(&bus, found: rows.contains { $0.type == "result" }, failure: "Logic 2 decoded no SPI words.")
+    case .i2c:
+        let rows = try await decodedRows(bus.decoder, captureID: captureID, in: directory, using: backend)
+        confirm(&bus, found: rows.contains { $0.type == "address" }, failure: "Logic 2 decoded no I2C addresses.")
+        if let nacks = decodeIssues(rows)["nack"] { bus.notes.append("\(nacks) NACKs were seen.") }
+    }
+    return bus
+}
+
+/// Leaves out frames a capture window can spoil. A capture that opens mid-frame stays
+/// misaligned until a gap longer than any frame, so everything before the first such gap
+/// is dropped, as is the last frame, which the window can cut short.
+func alignedFrames(_ rows: [DecodedRow], baud: Int64) -> [DecodedRow] {
+    let longestFrame = 13 / Double(baud)
+    let firstGap = rows.indices.dropLast().first { rows[$0 + 1].start - (rows[$0].start + rows[$0].duration) > longestFrame }
+    let start = firstGap.map { $0 + 1 } ?? 1
+    let aligned = Array(rows.dropFirst(start).dropLast())
+    return aligned.isEmpty ? Array(rows.dropFirst().dropLast()) : aligned
+}
+
+private func confirm(_ bus: inout IdentifiedBus, found: Bool, failure: String) {
+    bus.confidence = found ? .confirmed : .uncertain
+    if !found { bus.notes.append(failure) }
 }
 
 /// Runs a capture, decodes it, and writes the analyzer's data table to `file`.
@@ -151,23 +279,34 @@ func exportDecodedCapture(
     cancellation: CaptureCancellation
 ) async throws {
     try await runCapture(request.capture, using: backend, cancellation: cancellation) { captureID in
-        var add = Saleae_Automation_AddAnalyzerRequest()
-        add.captureID = captureID
-        add.analyzerName = request.decoder.analyzerName
-        add.analyzerLabel = request.decoder.analyzerName
-        add.settings = request.decoder.settings
-        let analyzerID = try await backend.addAnalyzer(add)
-
-        var analyzer = Saleae_Automation_DataTableAnalyzerConfiguration()
-        analyzer.analyzerID = analyzerID
-        analyzer.radixType = request.radix.type
-
-        var export = Saleae_Automation_ExportDataTableCsvRequest()
-        export.captureID = captureID
-        export.filepath = file.path
-        export.analyzers = [analyzer]
-        try await backend.exportDataTable(export)
+        try await exportDataTable(
+            request.decoder, radix: request.radix, captureID: captureID, to: file, using: backend)
     }
+}
+
+private func exportDataTable(
+    _ decoder: ProtocolDecoder,
+    radix: Radix,
+    captureID: UInt64,
+    to file: URL,
+    using backend: some CaptureBackend
+) async throws {
+    var add = Saleae_Automation_AddAnalyzerRequest()
+    add.captureID = captureID
+    add.analyzerName = decoder.analyzerName
+    add.analyzerLabel = decoder.analyzerName
+    add.settings = decoder.settings
+    let analyzerID = try await backend.addAnalyzer(add)
+
+    var analyzer = Saleae_Automation_DataTableAnalyzerConfiguration()
+    analyzer.analyzerID = analyzerID
+    analyzer.radixType = radix.type
+
+    var export = Saleae_Automation_ExportDataTableCsvRequest()
+    export.captureID = captureID
+    export.filepath = file.path
+    export.analyzers = [analyzer]
+    try await backend.exportDataTable(export)
 }
 
 /// Runs a capture in its mode and hands it to `process`. Once a capture has

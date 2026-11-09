@@ -25,8 +25,8 @@ drives the I2C ACK bits itself because the bus has no receiver.
 ## Modes
 
 Sending one character over USB serial at 115200 selects a mode, and the board replies
-`mode <key>`. Opening the port resets the board to `c`. Closing it does not, so send
-`c` when done. Modes other than `c` bit-bang UART and SPI, send the same bytes as above,
+`mode <key>`. Opening the port usually resets the board to `c`, but closing it does not, so
+send `c` when done. Modes other than `c` bit-bang UART and SPI, send the same bytes as above,
 and stop the PWM.
 
 | Key | UART                                 | SPI                     | I2C                        |
@@ -41,3 +41,9 @@ and stop the PWM.
 | `i` | 9 data bits, ninth set on first only | Mode 0                  | Clean                      |
 | `f` | 8N1: `41`, `42` with a bad stop, `43`| Mode 0                  | `AD` NACKed, then `0x43` unanswered |
 | `p` | 8E1: `44`, `45` with wrong parity    | Mode 0                  | Clean                      |
+| `r` | Random baud, parity, stop bits, inversion and 32 bytes | Mode 0 | Clean                |
+
+`r` first replies with the choices, as `random baud=57600 parity=E stop=2 inverted=1 data=<hex>`,
+so a test can compare them with what a blind analysis of the wires concludes. `R` is the
+same at a nominal 921600 baud. The bit-banged signal jitters by up to a quarter of a bit
+there and measures about 4% slow, so treat that rate as approximate.

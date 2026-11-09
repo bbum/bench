@@ -26,27 +26,10 @@ work that out from timing.
 Phase 3, capture modes: digital triggers with pulse widths and linked channels, manual
 capture, glitch filters, trim and the buffer limit, on both `capture` and `decode`.
 
-## Phase 4: Channel identification
-
-Work out what is on each channel so miswired signals can be corrected in software, with
-no replugging. Needs phase 2.
-
-- I2C: SDA changes only while SCL is low, apart from start and stop.
-- SPI: the clock has regular bursts in multiples of 8 cycles, CS frames them, and data
-  changes in step with the clock.
-- UART: idles high, and pulse widths are multiples of one bit time, which gives the baud
-  rate. Logic 2 flags nothing at a wrong rate, so work this out afterwards from one fast
-  digital capture, using a histogram of widths so a glitch cannot pose as a bit. Then
-  confirm by running decoders at candidate rates over that same capture. No device
-  reset or second capture is needed.
-- PWM and clocks: already detected as periodic.
-- Confirm candidates by running decoders over the same capture and keeping the wiring
-  that decodes cleanly.
-- Report confidence and ambiguity. Never pick silently.
-- Known limits: timing alone cannot separate MOSI from MISO or UART TX from RX, idle
-  lines reveal nothing, and two buses of one type cannot be told apart.
-- Proof: relabel the 8 recorded `testgen` channels and test all 40,320 wirings offline.
-  Then confirm on real hardware with some jumpers actually swapped.
+Phase 4, channel identification: `sal identify` names each bus from timing, then confirms
+it with Logic 2's decoders on the same capture. All 40,320 relabelings of the recorded
+channels are identified offline, and `testgen`'s random mode checks UART blind. Still
+to prove: a run with real jumpers swapped on the hardware.
 
 ## Phase 5: Analog
 
