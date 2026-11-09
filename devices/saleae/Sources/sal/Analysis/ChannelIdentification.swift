@@ -4,6 +4,8 @@ import Foundation
 struct IdentifiableChannel: Sendable {
     var summary: ChannelSummary
     var times: [Double]
+    var beginTime = 0.0
+    var endTime = 0.0
 
     var channel: UInt32 { summary.channel }
     var isIdle: Bool { times.isEmpty }

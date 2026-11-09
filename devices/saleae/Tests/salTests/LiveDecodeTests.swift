@@ -25,6 +25,11 @@ private let testExtensionDirectory = URL(fileURLWithPath: #filePath)
     .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
     .appendingPathComponent("testgen/hla").path
 
+private func latency(_ arguments: [String]) async throws -> LatencyResult {
+    let command = try #require(try Sal.parseAsRoot(["analyze", "latency"] + arguments) as? LatencyCommand)
+    return try await command.execute(handlingSignals: false)
+}
+
 private func loadRequest(_ path: String) -> DigitalCaptureRequest {
     DigitalCaptureRequest(channels: [], sampleRate: 1, mode: .load(path: path), levelVolts: 3.3, deviceID: nil)
 }
@@ -902,6 +907,72 @@ extension LiveTests {
             try await decode.run()
             #expect(FileManager.default.fileExists(atPath: table))
             #expect(FileManager.default.fileExists(atPath: legacy))
+        }
+    }
+
+    @Test("Known pulse widths measure as expected")
+    func latencyWidths() async throws {
+        try await withTestgen(mode: "c") {
+            let sync = try await latency(["--from", "1:rising", "--to", "1:falling", "--duration", "0.2"])
+            #expect((sync.latency?.minSeconds ?? 0) >= 13e-6)
+            #expect((sync.latency?.maxSeconds ?? 99) <= 18e-6)
+            #expect(sync.unmatched == 0)
+
+            let pwm = try await latency(["--from", "0:rising", "--to", "0:falling", "--duration", "0.05"])
+            #expect(abs((pwm.latency?.meanSeconds ?? 0) - 250e-6) < 3e-6)
+        }
+    }
+
+    @Test("Traffic follows the sync pulse, and SPI's clock follows chip select")
+    func latencyAcross() async throws {
+        try await withTestgen(mode: "c") {
+            let uart = try await latency(["--from", "1:rising", "--to", "2:falling", "--duration", "0.2"])
+            #expect((uart.latency?.minSeconds ?? 0) > 13e-6)
+            #expect((uart.latency?.maxSeconds ?? 99) < 100e-6)
+            let clock = try await latency(["--from", "5:falling", "--to", "3:rising", "--duration", "0.2"])
+            #expect((clock.latency?.maxSeconds ?? 99) < 10e-6)
+        }
+    }
+
+    @Test("SPI at 1 MHz has about half a period of setup and hold")
+    func spiSetupHold() async throws {
+        try await withTestgen(mode: "c") {
+            let parsed = try Sal.parseAsRoot([
+                "analyze", "setup-hold", "--clock", "3:rising", "--data", "4", "--duration", "0.2", "--rate", "250M",
+            ])
+            let command = try #require(parsed as? SetupHoldCommand)
+            let result = try await command.execute(handlingSignals: false)
+            #expect(abs(try #require(result.data[0].setup).meanSeconds - 500e-9) < 40e-9)
+            #expect(abs(try #require(result.data[0].hold).meanSeconds - 500e-9) < 40e-9)
+        }
+    }
+
+    @Test("Activity shows one burst per cycle on the UART")
+    func activity() async throws {
+        try await withTestgen(mode: "c") {
+            let parsed = try Sal.parseAsRoot(["analyze", "activity", "--channels", "1,2", "--duration", "0.3", "--gap", "200us"])
+            let command = try #require(parsed as? ActivityCommand)
+            let result = try await command.execute(handlingSignals: false)
+            #expect(abs(result[1].bursts - result[0].bursts) <= 1)
+            #expect(abs(try #require(result[1].meanBurstSeconds) - 1.12e-3) < 0.1e-3)
+            #expect(abs(result[1].busyPercent - 5) < 1)
+        }
+    }
+
+    @Test("Analysis works from a saved capture, and through a real MCP server")
+    func analyzeSavedAndMCP() async throws {
+        try await inScratch { directory in
+            let file = directory.appendingPathComponent("a.sal").path
+            let save = try CaptureCommand.parseAsRoot(["--channels", "0-1", "--duration", "0.05", "--save", file]) as! CaptureCommand
+            _ = try await save.execute(handlingSignals: false)
+
+            let saved = try await latency(["--from", "0:rising", "--to", "0:falling", "--load", file])
+            #expect(abs((saved.latency?.meanSeconds ?? 0) - 250e-6) < 3e-6)
+
+            let server = try MCPProcess()
+            defer { server.close() }
+            let live = try server.tool(1, "analyze", #"{"analysis":{"kind":"latency","from":"0:rising","to":"0:falling"},"duration":0.05}"#)
+            #expect(abs(live.number("latency", "meanSeconds") - 250e-6) < 3e-6)
         }
     }
 

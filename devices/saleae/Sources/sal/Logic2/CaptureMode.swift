@@ -23,6 +23,28 @@ private func channelAndName(_ argument: String) -> (channel: UInt32, name: Subst
     return (channel, parts[1])
 }
 
+enum EdgeKind: String, CaseIterable, Sendable {
+    case rising, falling, either
+}
+
+/// One kind of edge on one channel, written as `CH:rising`, `CH:falling` or `CH:either`.
+struct EdgeSelector: ExpressibleByArgument, Equatable, Sendable {
+    var channel: UInt32
+    var kind: EdgeKind
+
+    init(channel: UInt32, kind: EdgeKind) {
+        self.channel = channel
+        self.kind = kind
+    }
+
+    init?(argument: String) {
+        guard let (channel, name) = channelAndName(argument), let kind = EdgeKind(rawValue: String(name)) else {
+            return nil
+        }
+        self.init(channel: channel, kind: kind)
+    }
+}
+
 /// Ignores pulses narrower than a width on one channel. Written as `CH:WIDTH`.
 struct GlitchFilter: ExpressibleByArgument, Equatable, Sendable {
     var channel: UInt32

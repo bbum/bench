@@ -27,6 +27,8 @@ IDENTIFY = ROOT / "Analysis/ChannelIdentification.swift"
 ANALOG = ROOT / "Analysis/AnalogChannel.swift"
 SERVER = ROOT / "MCP/MCPServer.swift"
 TOOLS = ROOT / "MCP/SalTools.swift"
+TIMING = ROOT / "Analysis/Timing.swift"
+ANALYZE = ROOT / "Subcommands/AnalyzeCommand.swift"
 
 MUTANTS = [
     (CHANNEL, "guard version == 0 else", "guard version >= 0 else"),
@@ -169,6 +171,21 @@ MUTANTS = [
     (TOOLS, 'line.append("\\(flag)=\\(try scalarText(value, key: key))")', 'line.append(flag); line.append(try scalarText(value, key: key))'),
     (TOOLS, 'if arguments["manual"] == .bool(true), arguments["duration"] == nil {', "if false {"),
     (TOOLS, 'if arguments["limit"] == nil { line.append("--limit=\\(defaultToolRowLimit)") }', ""),
+    (TIMING, "medianSeconds = sorted[(sorted.count - 1) / 2]", "medianSeconds = sorted[sorted.count / 2]"),
+    (TIMING, "let wanted = kind == .rising ? 1 : 0", "let wanted = kind == .rising ? 0 : 1"),
+    (TIMING, "if index + 1 < from.count, end >= from[index + 1] { continue }", ""),
+    (TIMING, "end - start > maximum", "end - start >= maximum"),
+    (TIMING, "line.times[through - 1] == edge ? through - 2 : through - 1", "line.times[through - 1] == edge ? through - 1 : through - 1"),
+    (TIMING, "window.map({ setup <= $0 }) ?? true", "true"),
+    (TIMING, "window.map({ hold <= $0 }) ?? true", "true"),
+    (TIMING, "setups.count { $0 < limit }", "setups.count { $0 <= limit }"),
+    (TIMING, "holds.count { $0 < limit }", "holds.count { $0 <= limit }"),
+    (TIMING, "where next - previous > gap", "where next - previous >= gap"),
+    (TIMING, "max(first - channel.beginTime, channel.endTime - last)", "first - channel.beginTime"),
+    (TIMING, "    busy += last - burstStart\n", ""),
+    (ANALYZE, "guard from != to else", "guard true else"),
+    (ANALYZE, "guard clock.kind != .either else", "guard true else"),
+    (TOOLS, 'kind.replacingOccurrences(of: "_", with: "-")', "kind"),
     (MAIN, "guard !devices.isEmpty else", "guard devices.isEmpty else"),
 ]
 

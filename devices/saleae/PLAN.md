@@ -43,10 +43,13 @@ Phase 7, MCP server: `sal mcp` offers `status`, `capture`, `decode` and `identif
 the CLI's own parsing. Its tool list is about 10 KB against 168 KB for Saleae's server.
 Cancellation reaches a running capture, and a closed client cannot leave one running.
 
-## Phase 8: Cross-channel analysis
+Phase 8, cross-channel analysis: `sal analyze latency`, `setup-hold` and `activity`, also
+offered as the `analyze` MCP tool. They give delays between edges, data timing around a
+clock, and when each channel is busy.
 
-Latency between channels, setup and hold times, and bus activity. Grow this from real
-debugging sessions.
+## Next
+
+Grow the analysis from real debugging sessions.
 
 ## Not scheduled
 

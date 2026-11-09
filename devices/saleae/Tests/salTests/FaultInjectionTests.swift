@@ -584,6 +584,42 @@ struct AnalogCaptureFlowTests {
     }
 }
 
+@Suite("Edge capture flow")
+struct EdgeCaptureFlowTests {
+    @Test("Edges come back for the requested channels, with the capture's time range")
+    func named() async throws {
+        let backend = FakeBackend()
+        let channels = try await edgeCapture(request) { directory in
+            try await exportDigitalCapture(request, to: directory, using: backend, cancellation: CaptureCancellation())
+        }
+        #expect(channels.map(\.channel) == Array(0...7))
+        #expect(channels[0].endTime > channels[0].beginTime)
+        #expect(channels[0].times.count == channels[0].summary.edges)
+        #expect(await backend.calls == [.start, .wait, .export, .close])
+    }
+
+    @Test("A loaded capture reports every channel it holds")
+    func loaded() async throws {
+        let load = DigitalCaptureRequest(channels: [], sampleRate: 1, mode: .load(path: "/s.sal"), levelVolts: 3.3, deviceID: nil)
+        let backend = FakeBackend()
+        let channels = try await edgeCapture(load) { directory in
+            try await exportDigitalCapture(load, to: directory, using: backend, cancellation: CaptureCancellation())
+        }
+        #expect(channels.map(\.channel) == Array(0...7))
+    }
+
+    @Test("A failed export is reported")
+    func failed() async {
+        let backend = FakeBackend(failing: [.export])
+        await #expect(throws: InjectedFault.self) {
+            try await edgeCapture(request) { directory in
+                try await exportDigitalCapture(request, to: directory, using: backend, cancellation: CaptureCancellation())
+            }
+        }
+        #expect(await backend.closedIDs == [42])
+    }
+}
+
 private func captureRequest(_ mode: CaptureMode) -> DigitalCaptureRequest {
     DigitalCaptureRequest(channels: Array(0...7), sampleRate: 50_000_000, mode: mode, levelVolts: 3.3, deviceID: nil)
 }

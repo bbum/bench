@@ -251,12 +251,36 @@ func runIdentify(
     }
 }
 
+/// Runs a capture and returns its channels' edges, for measurements made afterwards.
+func runEdgeCapture(_ request: DigitalCaptureRequest, endpoint: Logic2Endpoint) async throws -> [IdentifiableChannel] {
+    try await withCaptureCancellation { cancellation in
+        try await edgeCapture(request) { directory in
+            try await withLogic2(endpoint) { manager in
+                try await exportDigitalCapture(
+                    request, to: directory, using: GRPCCaptureBackend(manager: manager), cancellation: cancellation)
+            }
+        }
+    }
+}
+
+func edgeCapture(
+    _ request: DigitalCaptureRequest,
+    export: (URL) async throws -> Void
+) async throws -> [IdentifiableChannel] {
+    try await inTemporaryDirectory { directory in
+        try await export(directory)
+        let digital = request.exportsEverything ? try exportedChannels(in: directory).digital : request.channels
+        return try loadChannels(directory: directory, channels: digital)
+    }
+}
+
 func loadChannels(directory: URL, channels: [UInt32]) throws -> [IdentifiableChannel] {
     try channels.map { channel in
         let digital = try DigitalChannel(
             contentsOf: directory.appendingPathComponent("digital_\(channel).bin"))
         let times = digital.withEdgeTimes { edges in (0..<edges.count).map { edges[$0] } }
-        return IdentifiableChannel(summary: summarize(digital, channel: channel), times: times)
+        return IdentifiableChannel(
+            summary: summarize(digital, channel: channel), times: times, beginTime: digital.beginTime, endTime: digital.endTime)
     }
 }
 

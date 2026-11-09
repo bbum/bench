@@ -57,6 +57,16 @@ private func requireManualLimit(_ arguments: JSONValue) throws {
     }
 }
 
+func analyzeCommandLine(_ arguments: JSONValue) throws -> [String] {
+    guard let analysis = arguments["analysis"], let kind = analysis["kind"]?.stringValue else {
+        throw ToolInputError(description: "analyze needs analysis, with kind latency, setup_hold or activity.")
+    }
+    guard let keys = analysisOptionKeys[kind] else { throw ToolInputError(description: "Unknown analysis: \(kind)") }
+    return ["analyze", kind.replacingOccurrences(of: "_", with: "-")]
+        + (try commandLine(from: analysis, allowed: keys, ignoring: ["kind"]))
+        + (try commandLine(from: arguments, allowed: captureKeys, ignoring: ["analysis"]))
+}
+
 func decodeCommandLine(_ arguments: JSONValue) throws -> [String] {
     guard let bus = arguments["bus"], let kind = bus["protocol"]?.stringValue else {
         throw ToolInputError(description: "decode needs bus, with protocol uart, spi or i2c.")
@@ -83,6 +93,7 @@ struct SalTools: ToolCatalog {
         case "capture": return try await callCapture(arguments)
         case "decode": return try await callDecode(arguments)
         case "identify": return try await callIdentify(arguments)
+        case "analyze": return try await callAnalyze(arguments)
         default: throw ToolInputError(description: "Unknown tool: \(name)")
         }
     }
@@ -108,6 +119,17 @@ struct SalTools: ToolCatalog {
         return try json(try await command.execute(handlingSignals: false))
     }
 
+    private func callAnalyze(_ arguments: JSONValue) async throws -> String {
+        try requireManualLimit(arguments)
+        let parsedCommand = try parsed(try analyzeCommandLine(arguments))
+        switch parsedCommand {
+        case let command as LatencyCommand: return try json(try await command.execute(handlingSignals: false))
+        case let command as SetupHoldCommand: return try json(try await command.execute(handlingSignals: false))
+        case let command as ActivityCommand: return try json(try await command.execute(handlingSignals: false))
+        default: throw ToolInputError(description: "Bad analyze command.")
+        }
+    }
+
     private func callDecode(_ arguments: JSONValue) async throws -> String {
         try requireManualLimit(arguments)
         guard let command = try parsed(try decodeCommandLine(arguments)) as? any DecodeInvocation else {
@@ -125,6 +147,12 @@ private let captureKeys: Set<String> = [
 private let decodeKeys: Set<String> = [
     "radix", "offset", "limit", "hla", "hla_extension", "hla_setting", "export_table", "iso8601", "columns", "filter",
     "filter_columns", "export_legacy",
+]
+
+private let analysisOptionKeys: [String: Set<String>] = [
+    "latency": ["from", "to", "max"],
+    "setup_hold": ["clock", "data", "min_setup", "min_hold"],
+    "activity": ["channels", "gap"],
 ]
 
 private let busOptionKeys: [String: Set<String>] = [
@@ -223,6 +251,29 @@ private let i2cBus = object([
     "scl": channel,
 ], required: ["protocol", "sda", "scl"])
 
+private let edgeDescription = "An edge: CH:rising, CH:falling or CH:either."
+
+private let latencyAnalysis = object([
+    "kind": .object(["const": .string("latency")]),
+    "from": field("string", edgeDescription),
+    "to": field("string", "The first such edge after from and before the next from. Same channel, opposite edge, gives pulse width."),
+    "max": field("string", "Ignore delays longer than this, such as 5ms."),
+], required: ["kind", "from", "to"])
+
+private let setupHoldAnalysis = object([
+    "kind": .object(["const": .string("setup_hold")]),
+    "clock": field("string", "The sampling edge: CH:rising or CH:falling."),
+    "data": .object(["type": .string("array"), "items": channel, "minItems": .int(1), "description": .string("Data channels.")]),
+    "min_setup": field("string", "Count setup times shorter than this as violations, such as 20ns."),
+    "min_hold": field("string", "Count hold times shorter than this as violations."),
+], required: ["kind", "clock", "data"])
+
+private let activityAnalysis = object([
+    "kind": .object(["const": .string("activity")]),
+    "channels": field("string", "Digital channels: 0-7 or 0,2,4. Default 0-7, or all with load."),
+    "gap": field("string", "Edges further apart than this start a new burst. Default 1ms."),
+], required: ["kind"])
+
 let toolDefinitions: [JSONValue] = [
     tool(
         "status", "Show the Logic 2 version and the connected devices.", object(endpointFields)),
@@ -262,4 +313,10 @@ let toolDefinitions: [JSONValue] = [
             "channels": field("string", "Digital channels: 0-7 or 0,2,4. Default 0-7, or all with load."),
             "no_confirm": field("boolean", "Trust timing alone, skipping the decoders."),
         ]) { first, _ in first })),
+    tool(
+        "analyze",
+        "Measure timing across channels: delay between edges, setup and hold around a clock, or when each channel is busy.",
+        object(captureFields.merging([
+            "analysis": .object(["oneOf": .array([latencyAnalysis, setupHoldAnalysis, activityAnalysis])]),
+        ]) { first, _ in first }, required: ["analysis"])),
 ]
