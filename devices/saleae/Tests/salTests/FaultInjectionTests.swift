@@ -620,6 +620,98 @@ struct EdgeCaptureFlowTests {
     }
 }
 
+@Suite("Timeline flow")
+struct TimelineFlowTests {
+    private let table = "name,type,start_time,duration,\"data\"\n\"a\",\"data\",0.01,0.001,0x41\n"
+
+    private func timeline(
+        _ backend: FakeBackend,
+        overlays: [ProtocolDecoder] = [],
+        maxSegments: Int = 2000,
+        cancellation: CaptureCancellation = CaptureCancellation()
+    ) async throws -> TimelineResult {
+        let input = TimelineRequest(capture: request, overlays: overlays, radix: .ascii, maxSegments: maxSegments)
+        return try await inTemporaryDirectory { directory in
+            try await exportTimeline(input, in: directory, using: backend, cancellation: cancellation)
+        }
+    }
+
+    private var tableBackend: FakeBackend {
+        let bytes = Data(table.utf8)
+        return FakeBackend(tableProvider: { _ in bytes })
+    }
+
+    @Test("Every channel is traced and each overlay decoded, then the capture closes")
+    func flow() async throws {
+        let backend = tableBackend
+        let result = try await timeline(backend, overlays: [uartDecoderForFlow, spiDecoderForFlow])
+        #expect(result.timeline.digital.map(\.channel) == Array(0...7))
+        #expect(result.timeline.overlays.map(\.label) == ["UART CH2", "SPI CH3,4"])
+        #expect(result.timeline.overlays[0].annotations.map(\.text) == ["0x41"])
+        #expect(await backend.calls == [.start, .wait, .export, .analyzer, .table, .analyzer, .table, .close])
+        #expect(await backend.tableRequest?.analyzers.map(\.radixType) == [.ascii])
+    }
+
+    @Test("Without overlays no decoder runs")
+    func noOverlays() async throws {
+        let backend = tableBackend
+        _ = try await timeline(backend)
+        #expect(await backend.calls == [.start, .wait, .export, .close])
+    }
+
+    @Test("The returned data can be thin while the drawing keeps full detail")
+    func detail() async throws {
+        let result = try await timeline(tableBackend, maxSegments: 10)
+        #expect(result.timeline.digital[3].segments.count <= 11)
+        #expect(result.detailed.digital[3].segments.count > 100)
+        #expect(result.detailed.digital[3].edges == result.timeline.digital[3].edges)
+    }
+
+    @Test("A failing overlay fails the timeline and still closes")
+    func failingOverlay() async {
+        let backend = FakeBackend(failing: [.analyzer])
+        await #expect(throws: InjectedFault.self) { try await timeline(backend, overlays: [uartDecoderForFlow]) }
+        #expect(await backend.closedIDs == [42])
+    }
+
+    @Test("Cancelling between overlays stops and closes")
+    func cancelled() async {
+        let cancellation = CaptureCancellation()
+        let bytes = Data(table.utf8)
+        let backend = FakeBackend(onEnter: { if $0 == .table { cancellation.cancel() } }, tableProvider: { _ in bytes })
+        await #expect(throws: CancellationError.self) {
+            try await timeline(backend, overlays: [uartDecoderForFlow, spiDecoderForFlow], cancellation: cancellation)
+        }
+        #expect(await backend.calls.filter { $0 == .analyzer }.count == 1)
+        #expect(await backend.closedIDs == [42])
+    }
+
+    @Test("A loaded capture traces every channel it holds")
+    func loaded() async throws {
+        let load = DigitalCaptureRequest(channels: [], sampleRate: 1, mode: .load(path: "/s.sal"), levelVolts: 3.3, deviceID: nil)
+        let backend = FakeBackend()
+        let result = try await inTemporaryDirectory { directory in
+            try await exportTimeline(TimelineRequest(capture: load, overlays: []), in: directory, using: backend, cancellation: CaptureCancellation())
+        }
+        #expect(result.timeline.digital.map(\.channel) == Array(0...7))
+    }
+
+    @Test("A window outside the capture is an error, and the capture closes")
+    func emptyWindow() async {
+        let backend = FakeBackend()
+        let input = TimelineRequest(capture: request, overlays: [], from: 100, to: 101)
+        await #expect(throws: TimelineError.emptyWindow) {
+            try await inTemporaryDirectory { directory in
+                try await exportTimeline(input, in: directory, using: backend, cancellation: CaptureCancellation())
+            }
+        }
+        #expect(await backend.closedIDs == [42])
+    }
+}
+
+private let uartDecoderForFlow = ProtocolDecoder.uart(UARTDecoder(channel: 2, baud: 115_200))
+private let spiDecoderForFlow = ProtocolDecoder.spi(SPIDecoder(clock: 3, mosi: 4))
+
 private func captureRequest(_ mode: CaptureMode) -> DigitalCaptureRequest {
     DigitalCaptureRequest(channels: Array(0...7), sampleRate: 50_000_000, mode: mode, levelVolts: 3.3, deviceID: nil)
 }

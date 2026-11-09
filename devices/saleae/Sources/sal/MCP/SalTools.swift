@@ -57,6 +57,15 @@ private func requireManualLimit(_ arguments: JSONValue) throws {
     }
 }
 
+/// Keeps inline timelines small. Drawn files are not affected.
+private let defaultToolSegmentLimit = 100
+
+func timelineCommandLine(_ arguments: JSONValue) throws -> [String] {
+    var line = ["timeline"] + (try commandLine(from: arguments, allowed: captureKeys.union(timelineKeys)))
+    if arguments["max_segments"] == nil { line.append("--max-segments=\(defaultToolSegmentLimit)") }
+    return line
+}
+
 func analyzeCommandLine(_ arguments: JSONValue) throws -> [String] {
     guard let analysis = arguments["analysis"], let kind = analysis["kind"]?.stringValue else {
         throw ToolInputError(description: "analyze needs analysis, with kind latency, setup_hold or activity.")
@@ -94,6 +103,7 @@ struct SalTools: ToolCatalog {
         case "decode": return try await callDecode(arguments)
         case "identify": return try await callIdentify(arguments)
         case "analyze": return try await callAnalyze(arguments)
+        case "timeline": return try await callTimeline(arguments)
         default: throw ToolInputError(description: "Unknown tool: \(name)")
         }
     }
@@ -116,6 +126,14 @@ struct SalTools: ToolCatalog {
         try requireManualLimit(arguments)
         let line = ["identify"] + (try commandLine(from: arguments, allowed: captureKeys.union(["channels", "no_confirm"])))
         guard let command = try parsed(line) as? IdentifyCommand else { throw ToolInputError(description: "Bad identify command.") }
+        return try json(try await command.execute(handlingSignals: false))
+    }
+
+    private func callTimeline(_ arguments: JSONValue) async throws -> String {
+        try requireManualLimit(arguments)
+        guard let command = try parsed(try timelineCommandLine(arguments)) as? TimelineCommand else {
+            throw ToolInputError(description: "Bad timeline command.")
+        }
         return try json(try await command.execute(handlingSignals: false))
     }
 
@@ -155,7 +173,12 @@ private let analysisOptionKeys: [String: Set<String>] = [
     "activity": ["channels", "gap"],
 ]
 
-private let busOptionKeys: [String: Set<String>] = [
+private let timelineKeys: Set<String> = [
+    "channels", "analog", "analog_rate", "analog_downsample", "from", "to", "overlay", "radix", "max_segments", "html",
+    "svg", "title",
+]
+
+let busOptionKeys: [String: Set<String>] = [
     "uart": ["channel", "baud", "bits", "parity", "stop", "order", "inverted", "mode"],
     "spi": ["clock", "mosi", "miso", "enable", "bits", "order", "cpol", "cpha", "enable_active_high"],
     "i2c": ["sda", "scl"],
@@ -319,4 +342,21 @@ let toolDefinitions: [JSONValue] = [
         object(captureFields.merging([
             "analysis": .object(["oneOf": .array([latencyAnalysis, setupHoldAnalysis, activityAnalysis])]),
         ]) { first, _ in first }, required: ["analysis"])),
+    tool(
+        "timeline",
+        "Show what each channel did across a time window, as low, high and active segments, with analog min and max and decoded bytes lined up. Can also draw an HTML or SVG file straight from the data; do not draw waveforms by hand.",
+        object(captureFields.merging([
+            "channels": field("string", "Digital channels: 0-7, 0,2,4, or none with analog. Default 0-7, or all with load."),
+            "analog": field("string", "Analog channels to record too, such as 0 or 0-3."),
+            "analog_rate": field("string", "Analog sample rate, default 1.5625M."),
+            "analog_downsample": bounded(1...1_000_000, "Keep one analog sample in this many."),
+            "from": field("string", "Start of the window, such as 12ms. Zero is the capture start, or the trigger. May be negative."),
+            "to": field("string", "End of the window."),
+            "overlay": strings("Decoders to line up, as identify prints them, such as uart --channel 2 --baud 115200."),
+            "radix": choice(Radix.allCases.map(\.rawValue), "How overlay values are shown. Default hex."),
+            "max_segments": bounded(2...maximumTimelineSegments, "Most segments per channel in the reply. Default 100. Drawn files always use full detail."),
+            "html": field("string", "Write the timeline to this HTML file."),
+            "svg": field("string", "Write the timeline to this SVG file."),
+            "title": field("string", "Title for the drawn timeline."),
+        ]) { first, _ in first })),
 ]

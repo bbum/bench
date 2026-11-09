@@ -976,6 +976,75 @@ extension LiveTests {
         }
     }
 
+    @Test("A zoomed timeline shows the sync pulse exactly, with the message lined up")
+    func timelineZoom() async throws {
+        try await withTestgen(mode: "c") {
+            try await inScratch { directory in
+                let html = directory.appendingPathComponent("t.html").path
+                let parsed = try Sal.parseAsRoot([
+                    "timeline", "--channels", "1,2", "--trigger", "1:rising", "--duration", "0.004", "--from", "0", "--to", "1.25ms",
+                    "--overlay", "uart --channel 2 --baud 115200", "--radix", "ascii", "--html", html, "--title", "zoom",
+                ])
+                let command = try #require(parsed as? TimelineCommand)
+                let timeline = try await command.execute(handlingSignals: false)
+
+                #expect(timeline.fromSeconds == 0)
+                let sync = timeline.digital[0].segments
+                #expect(sync[0].state == .high)
+                #expect(sync[0].end >= 13e-6 && sync[0].end <= 18e-6)
+                #expect(sync.count == 2)
+
+                let text = timeline.overlays[0].annotations.map(\.text).joined()
+                #expect(text.contains("TESTGEN UART"))
+                let page = try String(contentsOfFile: html, encoding: .utf8)
+                #expect(page.contains("<title>zoom</title>") && page.contains(">T</text>"))
+            }
+        }
+    }
+
+    @Test("A long timeline with few segments keeps its bursts and idle gaps")
+    func timelineThinned() async throws {
+        try await withTestgen(mode: "c") {
+            let parsed = try Sal.parseAsRoot(["timeline", "--channels", "2", "--duration", "0.2", "--max-segments", "40"])
+            let command = try #require(parsed as? TimelineCommand)
+            let timeline = try await command.execute(handlingSignals: false)
+            let segments = timeline.digital[0].segments
+            #expect(segments.count <= 41)
+            let bursts = segments.filter { $0.state == .active }
+            #expect(bursts.count >= 7)
+            // The capture window can cut the first and last in half.
+            #expect(bursts.dropFirst().dropLast().allSatisfy { abs(($0.end - $0.start) - 1.1e-3) < 0.2e-3 })
+        }
+    }
+
+    @Test("Analog follows the PWM on a timeline")
+    func timelineAnalog() async throws {
+        let parsed = try Sal.parseAsRoot(["timeline", "--channels", "none", "--analog", "0", "--duration", "0.02", "--max-segments", "500"])
+        let command = try #require(parsed as? TimelineCommand)
+        let timeline = try await command.execute(handlingSignals: false)
+        let trace = timeline.analog[0]
+        #expect(trace.minVolts.count <= 500)
+        #expect(try #require(trace.minVolts.min()) < 0.2)
+        #expect(try #require(trace.maxVolts.max()) > 3)
+    }
+
+    @Test("A timeline comes back through a real MCP server, and writes its file")
+    func timelineMCP() async throws {
+        try await inScratch { directory in
+            let svg = directory.appendingPathComponent("m.svg").path
+            let server = try MCPProcess()
+            defer { server.close() }
+            let reply = try server.tool(
+                1, "timeline",
+                #"{"channels":"1,2","duration":0.1,"overlay":["uart --channel 2 --baud 115200"],"svg":"\#(svg)"}"#)
+            #expect(reply["digital"]?.arrayCount == 2)
+            #expect(reply.number("digital", 1, "edges") > 0)
+            let drawing = try String(contentsOfFile: svg, encoding: .utf8)
+            #expect(drawing.hasPrefix("<svg"))
+            #expect(XMLParser(data: Data(drawing.utf8)).parse())
+        }
+    }
+
     @Test("The tool list through a real server is small")
     func mcpList() async throws {
         let server = try MCPProcess()

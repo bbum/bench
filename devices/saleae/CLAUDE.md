@@ -6,7 +6,8 @@ a CLI today and will grow an MCP server. First target is the Logic Pro 8.
 Status: `sal status`, `sal capture` (digital capture with a per-channel summary) and
 `sal decode uart|spi|i2c` (decoded rows with paging and issue counts) work, with timed,
 manual and trigger captures and glitch filters. `sal identify` works out what is on
-each channel, `sal analyze` measures timing across channels, and `sal capture --analog`
+each channel, `sal analyze` measures timing across channels, `sal timeline` shows and
+draws activity over a window, and `sal capture --analog`
 records analog with levels and duty. Every
 capturing command can `--save` to and `--load` from a `.sal` file. `sal mcp` serves
 these as MCP tools. See PLAN.md for the phases.

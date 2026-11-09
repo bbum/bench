@@ -428,7 +428,7 @@ struct MCPToolDefinitionTests {
         #expect(data.count < 20_000, "\(data.count) bytes, against 168 KB for Saleae's server")
     }
 
-    @Test("Each tool is described, with no top-level oneOf", arguments: ["status", "capture", "decode", "identify", "analyze"])
+    @Test("Each tool is described, with no top-level oneOf", arguments: ["status", "capture", "decode", "identify", "analyze", "timeline"])
     func shape(name: String) throws {
         let schema = try toolSchema(name)
         #expect(tools.hasTool(named: name))
@@ -440,7 +440,7 @@ struct MCPToolDefinitionTests {
 
     @Test("Tool names are exact")
     func names() {
-        #expect(toolDefinitions.compactMap { $0["name"]?.stringValue } == ["status", "capture", "decode", "identify", "analyze"])
+        #expect(toolDefinitions.compactMap { $0["name"]?.stringValue } == ["status", "capture", "decode", "identify", "analyze", "timeline"])
         #expect(!tools.hasTool(named: "other"))
     }
 

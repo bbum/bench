@@ -12,14 +12,7 @@ struct CaptureCommand: AsyncParsableCommand {
     @Option(help: "Digital channels, such as 0-7 or 0,2,4, or none with --analog. Defaults to 0-7, or all with --load.")
     var channels: String?
 
-    @Option(help: "Analog channels to record too, such as 0 or 0-3.")
-    var analog: String?
-
-    @Option(help: "Analog sample rate, such as 1.5625M. Only some pairings with --rate are valid.")
-    var analogRate = "1.5625M"
-
-    @Option(help: "Keep one analog sample in this many, from 1 to 1,000,000.")
-    var analogDownsample: UInt64 = 1
+    @OptionGroup var analogOptions: AnalogOptions
 
     @Option(help: "Also write Logic 2's raw sample CSV files to this existing directory.")
     var exportCsv: String?
@@ -31,23 +24,14 @@ struct CaptureCommand: AsyncParsableCommand {
     var json = false
 
     func validate() throws {
-        guard (1...maximumAnalogDownsample).contains(analogDownsample) else {
-            throw ValidationError("--analog-downsample must be from 1 to \(maximumAnalogDownsample).")
-        }
-        guard channels != "none" || analog != nil else {
+        guard channels != "none" || analogOptions.analog != nil else {
             throw ValidationError("--channels none needs --analog.")
         }
         guard !iso8601 || exportCsv != nil else { throw ValidationError("--iso8601 needs --export-csv.") }
     }
 
     var analogCapture: AnalogCapture? {
-        get throws {
-            try analog.map {
-                AnalogCapture(
-                    channels: try parseChannelList($0), sampleRate: try parseSampleRate(analogRate),
-                    downsample: analogDownsample)
-            }
-        }
+        get throws { try analogOptions.analogCapture }
     }
 
     func run() async throws {

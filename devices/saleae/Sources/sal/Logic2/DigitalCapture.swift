@@ -251,6 +251,68 @@ func runIdentify(
     }
 }
 
+struct TimelineRequest: Sendable {
+    var capture: DigitalCaptureRequest
+    var overlays: [ProtocolDecoder]
+    var radix = Radix.hex
+    var from: Double?
+    var to: Double?
+    var maxSegments = 2000
+}
+
+/// Drawn files use this much detail, however thin the returned data is.
+let timelineDrawingDetail = 4000
+
+struct TimelineResult: Sendable {
+    /// The data for the caller, thinned to the requested size.
+    var timeline: Timeline
+    /// The same window at drawing detail.
+    var detailed: Timeline
+}
+
+func runTimeline(_ request: TimelineRequest, endpoint: Logic2Endpoint) async throws -> TimelineResult {
+    try await withCaptureCancellation { cancellation in
+        try await inTemporaryDirectory { directory in
+            try await withLogic2(endpoint) { manager in
+                try await exportTimeline(
+                    request, in: directory, using: GRPCCaptureBackend(manager: manager), cancellation: cancellation)
+            }
+        }
+    }
+}
+
+func exportTimeline(
+    _ request: TimelineRequest,
+    in directory: URL,
+    using backend: some CaptureBackend,
+    cancellation: CaptureCancellation
+) async throws -> TimelineResult {
+    var result: TimelineResult?
+    try await runCapture(request.capture, using: backend, cancellation: cancellation) { captureID in
+        try await exportBinary(request.capture, captureID: captureID, to: directory, using: backend)
+        let (digital, analog) =
+            request.capture.exportsEverything
+            ? try exportedChannels(in: directory) : (request.capture.channels, request.capture.analog?.channels ?? [])
+
+        var overlays: [(decoder: ProtocolDecoder, rows: [DecodedRow])] = []
+        for decoder in request.overlays {
+            try cancellation.checkCancelled()
+            overlays.append((decoder, try await decodedRows(decoder, radix: request.radix, captureID: captureID, in: directory, using: backend)))
+        }
+
+        let input = TimelineInput(
+            digital: try loadChannels(directory: directory, channels: digital),
+            analog: try analog.map { channel in
+                (channel, try AnalogChannel(contentsOf: directory.appendingPathComponent("analog_\(channel).bin")))
+            },
+            overlays: overlays)
+        result = TimelineResult(
+            timeline: try buildTimeline(input, from: request.from, to: request.to, maxSegments: request.maxSegments),
+            detailed: try buildTimeline(input, from: request.from, to: request.to, maxSegments: timelineDrawingDetail))
+    }
+    return result!
+}
+
 /// Runs a capture and returns its channels' edges, for measurements made afterwards.
 func runEdgeCapture(_ request: DigitalCaptureRequest, endpoint: Logic2Endpoint) async throws -> [IdentifiableChannel] {
     try await withCaptureCancellation { cancellation in
@@ -287,13 +349,14 @@ func loadChannels(directory: URL, channels: [UInt32]) throws -> [IdentifiableCha
 /// Decodes a capture already held by Logic 2.
 private func decodedRows(
     _ decoder: ProtocolDecoder,
+    radix: Radix = .hex,
     captureID: UInt64,
     in directory: URL,
     using backend: some CaptureBackend
 ) async throws -> [DecodedRow] {
     let file = directory.appendingPathComponent("confirm-\(UUID().uuidString).csv")
     try await exportDataTable(
-        decoder, radix: .hex, captureID: captureID, to: file, using: backend)
+        decoder, radix: radix, captureID: captureID, to: file, using: backend)
     return try decodedRows(fromCSV: Data(contentsOf: file))
 }
 

@@ -8,13 +8,16 @@ struct Seconds: ExpressibleByArgument, Equatable, Sendable {
     init(_ value: Double) { self.value = value }
 
     init?(argument: String) {
-        let units: [(suffix: String, scale: Double)] = [("ns", 1e-9), ("us", 1e-6), ("ms", 1e-3), ("s", 1)]
-        let unit = units.first { argument.hasSuffix($0.suffix) }
-        guard let number = Double(argument.dropLast(unit?.suffix.count ?? 0)) else { return nil }
-        let value = number * (unit?.scale ?? 1)
-        guard value.isFinite, value > 0 else { return nil }
+        guard let value = parseScaledSeconds(argument), value.isFinite, value > 0 else { return nil }
         self.value = value
     }
+}
+
+/// Reads seconds, or a value with an ns, us, ms or s suffix.
+func parseScaledSeconds(_ text: String) -> Double? {
+    let units: [(suffix: String, scale: Double)] = [("ns", 1e-9), ("us", 1e-6), ("ms", 1e-3), ("s", 1)]
+    let unit = units.first { text.hasSuffix($0.suffix) }
+    return Double(text.dropLast(unit?.suffix.count ?? 0)).map { $0 * (unit?.scale ?? 1) }
 }
 
 private func channelAndName(_ argument: String) -> (channel: UInt32, name: Substring)? {

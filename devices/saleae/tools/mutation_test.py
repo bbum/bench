@@ -29,6 +29,9 @@ SERVER = ROOT / "MCP/MCPServer.swift"
 TOOLS = ROOT / "MCP/SalTools.swift"
 TIMING = ROOT / "Analysis/Timing.swift"
 ANALYZE = ROOT / "Subcommands/AnalyzeCommand.swift"
+TIMELINE = ROOT / "Analysis/Timeline.swift"
+RENDER = ROOT / "Rendering/TimelineRenderer.swift"
+TIMELINE_CMD = ROOT / "Subcommands/TimelineCommand.swift"
 
 MUTANTS = [
     (CHANNEL, "guard version == 0 else", "guard version >= 0 else"),
@@ -57,7 +60,7 @@ MUTANTS = [
     (CAPTURE, "export.analogDownsampleRatio = request.analog?.downsample ?? 1", "export.analogDownsampleRatio = 2"),
     (MODE, "device.analogSampleRate = analog?.sampleRate ?? 0", "device.analogSampleRate = 0"),
     (OPTIONS, 'analog == nil ? "50M" : "6.25M"', '"50M"'),
-    (COMMAND, "(1...maximumAnalogDownsample).contains", "(0...maximumAnalogDownsample).contains"),
+    (OPTIONS, "(1...maximumAnalogDownsample).contains", "(0...maximumAnalogDownsample).contains"),
     (ANALOG, "guard type == 1 else", "guard type >= 0 else"),
     (ANALOG, "guard begin.isFinite else", "guard true else"),
     (ANALOG, "downsample > 0, downsample <= rate else", "downsample > 0 else"),
@@ -71,7 +74,7 @@ MUTANTS = [
     (ANALOG, "abs($0 - median) <= median * 0.05", "abs($0 - median) <= median * 0.2"),
     (ANALOG, "highAtLastRise - highAtFirstRise", "highAtLastRise"),
     (MODE, "device.digitalThresholdVolts = levelVolts", "device.digitalThresholdVolts = 1.8"),
-    (MODE, "guard value.isFinite, value > 0 else", "guard value.isFinite else"),
+    (MODE, "value.isFinite, value > 0 else", "value.isFinite else"),
     (MODE, "trigger.maximumPulse?.value ?? (", "trigger.minimumPulse?.value ?? ("),
     (MODE, "trigger.point.kind.isPulse ? unboundedPulseSeconds : 0", "unboundedPulseSeconds"),
     (MODE, "trigger.point.kind.isPulse ? unboundedPulseSeconds : 0", "0"),
@@ -186,6 +189,43 @@ MUTANTS = [
     (ANALYZE, "guard from != to else", "guard true else"),
     (ANALYZE, "guard clock.kind != .either else", "guard true else"),
     (TOOLS, 'kind.replacingOccurrences(of: "_", with: "-")', "kind"),
+    (TIMELINE, "channel.edgesThrough(to.nextDown)", "channel.edgesThrough(to)"),
+    (TIMELINE, "channel.edgesThrough(from + windowStartTolerance)", "channel.edgesThrough(from)"),
+    (TIMELINE, "windowStartTolerance = 1e-12", "windowStartTolerance = 1e-8"),
+    (TIMELINE, "guard pieces.count > maxSegments else", "guard pieces.count >= maxSegments else"),
+    (TIMELINE, "let resolution = 2 * (to - from)", "let resolution = 1 * (to - from)"),
+    (TIMELINE, "run.count == 1 ? head : ", ""),
+    (TIMELINE, "edges: run.count - 1", "edges: run.count"),
+    (TIMELINE, "if piece.end - piece.start < resolution {", "if piece.end - piece.start <= 0 {"),
+    (TIMELINE, "    flushRun()\n    return DigitalTrace", "    return DigitalTrace"),
+    (TIMELINE, "low = min(low, samples[position])", "low = samples[position]"),
+    (TIMELINE, "high = max(high, samples[position])", "high = samples[position]"),
+    (TIMELINE, "(volts * 1000).rounded() / 1000", "volts"),
+    (TIMELINE, "let lower = max(0, ((from - analog.beginTime) * rate - sampleEpsilon)", "let lower = max(0, ((from - analog.beginTime) * rate)"),
+    (TIMELINE, 'where row.type != "enable" && row.type != "disable"', ""),
+    (TIMELINE, "guard row.start < to, end >= from else { continue }", "guard row.start <= to, end >= from else { continue }"),
+    (TIMELINE, "guard row.start < to, end >= from else { continue }", "guard row.start < to, end > from else { continue }"),
+    (TIMELINE, "if annotations.count > maxAnnotations {", "if annotations.count > maxAnnotations + 1 {"),
+    (TIMELINE, "leftProblem != rightProblem ? leftProblem : left < right", "left < right"),
+    (TIMELINE, "max(maxAnnotations, annotations.count { $0.problem != nil })", "maxAnnotations"),
+    (TIMELINE, "spi.miso.flatMap { _ in row.fields[\"miso\"] }", "row.fields[\"miso\"]"),
+    (TIMELINE, "let start = max(from ?? earliest, earliest)", "let start = from ?? earliest"),
+    (TIMELINE, "let end = min(to ?? latest, latest)", "let end = to ?? latest"),
+    (TIMELINE, "guard end > start else { throw TimelineError.emptyWindow }", "guard end >= start else { throw TimelineError.emptyWindow }"),
+    (RENDER, 'case "&": escaped += "&amp;"', 'case "&": escaped += "&"'),
+    (RENDER, 'case "<": escaped += "&lt;"', 'case "<": escaped += "<"'),
+    (RENDER, "case _ where scalar.value < 0x20", "case _ where scalar.value < 0x01"),
+    (RENDER, "if boxWidth >= Double(annotation.text.count) * 7.4 {", "if true {"),
+    (RENDER, "let range = max(high - low, 0.001)", "let range = high - low"),
+    (RENDER, 'annotation.problem == nil ? "note" : "bad"', '"note"'),
+    (RENDER, 'overlay.omitted > 0 ? " +\\(overlay.omitted)" : ""', '""'),
+    (RENDER, "abs(seconds) < 1e-12", "seconds == 0"),
+    (RENDER, "scaled <= 1 ? 1 : scaled <= 2 ? 2 : scaled <= 5 ? 5 : 10", "scaled <= 1 ? 1 : scaled <= 5 ? 5 : 10"),
+    (TIMELINE_CMD, "guard allowed.contains(name) else", "guard true else"),
+    (TIMELINE_CMD, 'if Array(tokens.prefix(2)) == ["sal", "decode"] { tokens.removeFirst(2) }', ""),
+    (TIMELINE_CMD, "guard from.seconds < to.seconds else", "guard from.seconds <= to.seconds else"),
+    (TIMELINE_CMD, "guard let value = parseScaledSeconds(argument), value.isFinite else", "guard let value = parseScaledSeconds(argument) else"),
+    (TOOLS, 'if arguments["max_segments"] == nil { line.append("--max-segments=\\(defaultToolSegmentLimit)") }', ""),
     (MAIN, "guard !devices.isEmpty else", "guard devices.isEmpty else"),
 ]
 

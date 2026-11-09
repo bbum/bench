@@ -1,6 +1,34 @@
 import ArgumentParser
 import Foundation
 
+/// Analog channels to record. Shared by the commands that report analog.
+struct AnalogOptions: ParsableArguments {
+    @Option(help: "Analog channels to record too, such as 0 or 0-3.")
+    var analog: String?
+
+    @Option(help: "Analog sample rate, such as 1.5625M. Only some pairings with --rate are valid.")
+    var analogRate = "1.5625M"
+
+    @Option(help: "Keep one analog sample in this many, from 1 to 1,000,000.")
+    var analogDownsample: UInt64 = 1
+
+    func validate() throws {
+        guard (1...maximumAnalogDownsample).contains(analogDownsample) else {
+            throw ValidationError("--analog-downsample must be from 1 to \(maximumAnalogDownsample).")
+        }
+    }
+
+    var analogCapture: AnalogCapture? {
+        get throws {
+            try analog.map {
+                AnalogCapture(
+                    channels: try parseChannelList($0), sampleRate: try parseSampleRate(analogRate),
+                    downsample: analogDownsample)
+            }
+        }
+    }
+}
+
 /// How to run a capture. Shared by every command that captures.
 struct CaptureOptions: ParsableArguments {
     @OptionGroup var logic2: Logic2Options

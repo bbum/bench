@@ -113,15 +113,21 @@ func decodedRows(fromCSV bytes: Data) throws -> [DecodedRow] {
 /// byte of an I2C read is how a controller ends the read, so it does not count.
 func decodeIssues(_ rows: [DecodedRow]) -> [String: Int] {
     var issues: [String: Int] = [:]
-    var reading = false
-    for row in rows {
-        if let error = row.fields["error"] { issues[error, default: 0] += 1 }
-        if row.type == "address", let read = row.fields["read"] { reading = read == "true" }
-        if row.fields["ack"] == "false", row.type == "address" || !reading {
-            issues["nack", default: 0] += 1
-        }
+    for label in decodeIssueLabels(rows) {
+        if let label { issues[label, default: 0] += 1 }
     }
     return issues
+}
+
+/// The problem with each row, if it has one.
+func decodeIssueLabels(_ rows: [DecodedRow]) -> [String?] {
+    var reading = false
+    return rows.map { row in
+        if row.type == "address", let read = row.fields["read"] { reading = read == "true" }
+        if let error = row.fields["error"] { return error }
+        if row.fields["ack"] == "false", row.type == "address" || !reading { return "nack" }
+        return nil
+    }
 }
 
 struct DecodePage: Encodable, Equatable, Sendable {

@@ -47,13 +47,16 @@ Phase 8, cross-channel analysis: `sal analyze latency`, `setup-hold` and `activi
 offered as the `analyze` MCP tool. They give delays between edges, data timing around a
 clock, and when each channel is busy.
 
+Timeline: `sal timeline` and the `timeline` MCP tool show what channels did over a window,
+with analog and decoded data lined up, and draw HTML or SVG straight from the data.
+
 ## Next
 
-Grow the analysis from real debugging sessions.
+Grow the analysis from real debugging sessions. Once a few reports exist, write a small
+skill for choosing windows and writing up findings. The drawing stays in `sal`, so an
+LLM directs the tool but never draws a waveform itself.
 
 ## Not scheduled
 
-- Rename the repo to `bench`, at any commit point. Covers `~/Developer/ow`, the GitHub
-  repo, `origin`, the Roost project entry and the Claude memory folder.
 - Report the schema problems to Saleae at https://contact.saleae.com.
 - Testing other Saleae devices, once there is one to test.
