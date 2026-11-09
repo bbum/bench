@@ -7,19 +7,16 @@ Hardware is an accepted test dependency. The yardstick is complete functionality
 coverage: every capability gets a `sal` command and a live test against `testgen`.
 
 Every phase ships with the layers in CLAUDE.md under Testing, and is done when
-`make test`, `make verify`, `make coverage` and `make mutation` all pass.
+`make test`, `make verify` and `make coverage` all pass. `make mutation` is slow, so it
+runs on demand rather than every phase.
 
 ## Done
 
 Foundation: gRPC client, `sal status`, `sal capture` with per-channel summaries, binary
-export parser, the `testgen` board, and the test layers. Uses 6 of the 16 RPCs.
+export parser, the `testgen` board, and the test layers. Uses 7 of the 16 RPCs.
 
-## Phase 1: Cancellation
-
-Ctrl-C or task cancellation closes the capture and removes temp files. Must be finished
-before an MCP server can start long-running captures.
-
-- Proof: interrupt a live capture, then confirm a new capture runs cleanly.
+Phase 1, cancellation: Ctrl-C, SIGTERM or task cancellation stops and closes the capture
+and removes temp files.
 
 ## Phase 2: Decoders
 

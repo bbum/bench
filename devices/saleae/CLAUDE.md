@@ -27,14 +27,16 @@ Tested the way SQLite is. New parsing or analysis code ships with all of these:
 - **Coverage:** `make coverage` reports region coverage of hand-written code. Swift
   tooling has no MC/DC or branch data, so regions are the measure.
 - **Mutation:** `make mutation` injects bugs from `tools/mutation_test.py` one at a
-  time, and the offline tests must catch each. Add mutants for new logic.
+  time, and the offline tests must catch each. Add mutants for new logic. Takes 20
+  minutes or more, so run it on demand, not routinely.
 - **Boundaries:** test both sides of every threshold.
 - **Corrupt input:** every truncation, every header byte value, hostile values in every
   field, and seeded random corruption. Must reject or summarize, never trap.
 - **Differential:** an independently written oracle checks summaries on every 12-slot
   edge pattern, generated signals and real captures.
 - **Fault injection:** every Logic 2 call fails, alone and in every combination.
-  Started captures must close and temp files must go.
+  Started captures must close and temp files must go. The same holds when cancelled
+  at every step.
 - **Hardware:** `make verify` checks a live capture of `testgen`.
 - **Regressions:** every bug found gets a test.
 
@@ -58,6 +60,8 @@ Tested the way SQLite is. New parsing or analysis code ships with all of these:
   - `Async Serial`: `Input Channel`, `Bit Rate (Bits/s)` (a number)
   - `SPI`: `Clock`, `MOSI`, `Enable`
   - `I2C`: `SDA`, `SCL`
+- Cancelling a capture must not cancel its cleanup, or the gRPC connection goes with it.
+  `withCaptureCancellation` shields the work, and only the wait is interruptible.
 - The deployment target is macOS 27.0 because the current toolchain rejects 27.2.
 - Binary exports: this Logic Pro 8 on Logic 2.4.48 produces format V0 (confirmed by
   capture). Saleae says the device will move to a chunked V1, so check the version

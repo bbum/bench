@@ -17,6 +17,26 @@ struct LiveTests {
         try Testgen.verify(try await runDigitalCapture(request, endpoint: Logic2Endpoint()))
     }
 
+    @Test("Cancelling a long live capture ends it promptly and the next capture is clean")
+    func cancelledCapture() async throws {
+        let long = DigitalCaptureRequest(
+            channels: Array(0...7), sampleRate: 50_000_000, durationSeconds: 60, levelVolts: 3.3,
+            deviceID: nil)
+        let task = Task { try await runDigitalCapture(long, endpoint: Logic2Endpoint()) }
+        try await Task.sleep(for: .seconds(2))
+
+        let clock = ContinuousClock()
+        let cancelled = clock.now
+        task.cancel()
+        await #expect(throws: CancellationError.self) { try await task.value }
+        #expect(clock.now - cancelled < .seconds(15))
+
+        let next = DigitalCaptureRequest(
+            channels: Array(0...7), sampleRate: 50_000_000, durationSeconds: 0.5, levelVolts: 3.3,
+            deviceID: nil)
+        try Testgen.verify(try await runDigitalCapture(next, endpoint: Logic2Endpoint()))
+    }
+
     @Test("The status command runs")
     func status() async throws {
         let command = try Status.parseAsRoot(["--port", "10430"]) as! Status

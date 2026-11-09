@@ -4,7 +4,9 @@
 Run from devices/saleae with `make mutation`. Sources are restored after each mutant.
 """
 
+import os
 import pathlib
+import signal
 import subprocess
 import sys
 
@@ -14,6 +16,7 @@ SUMMARY = ROOT / "Analysis/ChannelSummary.swift"
 CAPTURE = ROOT / "Logic2/DigitalCapture.swift"
 COMMAND = ROOT / "Subcommands/CaptureCommand.swift"
 MAIN = ROOT / "sal.swift"
+CANCEL = ROOT / "Logic2/Cancellation.swift"
 
 MUTANTS = [
     (CHANNEL, "guard version == 0 else", "guard version >= 0 else"),
@@ -43,6 +46,19 @@ MUTANTS = [
     (CAPTURE, "device.digitalThresholdVolts = request.levelVolts", "device.digitalThresholdVolts = 1.8"),
     (CAPTURE, "    try await backend.closeCapture(captureID)\n}", "    try? await backend.closeCapture(captureID)\n}"),
     (CAPTURE, "    defer { try? FileManager.default.removeItem(at: directory) }\n", ""),
+    (CAPTURE, "    try cancellation.checkCancelled()\n    let captureID", "    let captureID"),
+    (CAPTURE, "        try cancellation.checkCancelled()\n    } catch", "    } catch"),
+    (CAPTURE, "if cancellation.isCancelled { try? await backend.stopCapture(captureID) }", ""),
+    (CAPTURE, "if cancellation.isCancelled { try?", "try? await backend.stopCapture(captureID); if false { try?"),
+    (CAPTURE, "try await cancellation.interruptible { try await backend.waitCapture(captureID) }", "try await backend.waitCapture(captureID)"),
+    (CANCEL, "        task?.cancel()\n", ""),
+    (CANCEL, "        try checkCancelled()\n        let task", "        let task"),
+    (CANCEL, "            try checkCancelled()\n            throw error", "            throw error"),
+    (CANCEL, "        }\n        try checkCancelled()\n    }", "        }\n    }"),
+    (CANCEL, "        cancellation.cancel()\n", ""),
+    (CANCEL, "            signal(number, previous)\n            work.cancel()", "            work.cancel()"),
+    (CANCEL, "            signal(number, previous)\n            work.cancel()", "            signal(number, previous)"),
+    (COMMAND, "interruptedExitCode: Int32 = 130", "interruptedExitCode: Int32 = 1"),
     (COMMAND, "maximumChannel: UInt32 = 15", "maximumChannel: UInt32 = 16"),
     (COMMAND, ",\n        rate > 0\n", "\n"),
     (COMMAND, "guard duration.isFinite, duration > 0", "guard duration > 0"),
@@ -54,11 +70,18 @@ MUTANTS = [
 
 def caught_by_tests() -> bool:
     """True when the mutant fails to compile, crashes, or fails a test."""
-    try:
-        result = subprocess.run(["swift", "test"], capture_output=True, timeout=300)
-    except subprocess.TimeoutExpired:
-        return True
-    return result.returncode != 0
+    # A separate process group, because killing swift test alone orphans its test helper.
+    with subprocess.Popen(
+        ["swift", "test"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    ) as process:
+        try:
+            return process.wait(timeout=300) != 0
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            return True
 
 
 def compiles() -> bool:

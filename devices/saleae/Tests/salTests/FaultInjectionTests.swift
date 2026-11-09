@@ -1,50 +1,65 @@
 import Foundation
+import Synchronization
 import Testing
 @testable import sal
 
-private enum Step: CaseIterable, Sendable { case start, wait, export, close }
+private enum Step: CaseIterable, Sendable { case start, stop, wait, export, close }
 private struct InjectedFault: Error, Equatable {}
 
 private actor FakeBackend: CaptureBackend {
     let failing: Set<Step>
+    let hanging: Set<Step>
+    let onEnter: @Sendable (Step) async -> Void
     let writeExport: @Sendable (URL) throws -> Void
     private(set) var calls: [Step] = []
     private(set) var closedIDs: [UInt64] = []
+    private(set) var closeSawCancellation = false
     private(set) var startRequest: Saleae_Automation_StartCaptureRequest?
     private(set) var exportRequest: Saleae_Automation_ExportRawDataBinaryRequest?
 
     init(
         failing: Set<Step> = [],
+        hanging: Set<Step> = [],
+        onEnter: @escaping @Sendable (Step) async -> Void = { _ in },
         writeExport: @escaping @Sendable (URL) throws -> Void = copyFixtures
     ) {
         self.failing = failing
+        self.hanging = hanging
+        self.onEnter = onEnter
         self.writeExport = writeExport
     }
 
-    private func record(_ step: Step) throws {
+    private func record(_ step: Step) async throws {
         calls.append(step)
+        await onEnter(step)
         if failing.contains(step) { throw InjectedFault() }
+        if hanging.contains(step) { try await Task.sleep(for: .seconds(3600)) }
     }
 
     func startCapture(_ request: Saleae_Automation_StartCaptureRequest) async throws -> UInt64 {
         startRequest = request
-        try record(.start)
+        try await record(.start)
         return 42
     }
 
+    func stopCapture(_ captureID: UInt64) async throws {
+        try await record(.stop)
+    }
+
     func waitCapture(_ captureID: UInt64) async throws {
-        try record(.wait)
+        try await record(.wait)
     }
 
     func exportBinary(_ request: Saleae_Automation_ExportRawDataBinaryRequest) async throws {
         exportRequest = request
-        try record(.export)
+        try await record(.export)
         try writeExport(URL(fileURLWithPath: request.directory))
     }
 
     func closeCapture(_ captureID: UInt64) async throws {
         closedIDs.append(captureID)
-        try record(.close)
+        closeSawCancellation = Task.isCancelled
+        try await record(.close)
     }
 }
 
@@ -63,13 +78,14 @@ private let request = DigitalCaptureRequest(
 /// Runs a capture, reporting the directory it used so cleanup can be checked.
 private func run(
     _ backend: FakeBackend,
-    request: DigitalCaptureRequest = request
+    request: DigitalCaptureRequest = request,
+    cancellation: CaptureCancellation = CaptureCancellation()
 ) async throws -> (summary: CaptureSummary, directory: URL) {
     final class Box: @unchecked Sendable { var directory: URL? }
     let box = Box()
     let summary = try await summarizedCapture(request) { directory in
         box.directory = directory
-        try await exportDigitalCapture(request, to: directory, using: backend)
+        try await exportDigitalCapture(request, to: directory, using: backend, cancellation: cancellation)
     }
     return (summary, box.directory!)
 }
@@ -163,7 +179,8 @@ struct FaultInjectionTests {
             let box = Box()
             _ = try? await summarizedCapture(request) { directory in
                 box.directory = directory
-                try await exportDigitalCapture(request, to: directory, using: backend)
+                try await exportDigitalCapture(
+                    request, to: directory, using: backend, cancellation: CaptureCancellation())
             }
 
             let closes = await backend.closedIDs.count
@@ -208,5 +225,140 @@ struct FaultInjectionTests {
         await #expect(throws: (any Error).self) {
             try await runDigitalCapture(request, endpoint: Logic2Endpoint(host: "127.0.0.1", port: 1))
         }
+    }
+}
+
+private func installedHandler(_ number: Int32) -> Int {
+    var current = sigaction()
+    sigaction(number, nil, &current)
+    return unsafeBitCast(current.__sigaction_u.__sa_handler, to: Int.self)
+}
+
+@Suite("Cancellation")
+struct CancellationTests {
+    /// Runs a capture that is cancelled on entering `step`, returning the temp directory.
+    private func runCancelled(
+        at step: Step,
+        failing: Set<Step> = [],
+        hanging: Set<Step> = []
+    ) async throws -> (FakeBackend, URL) {
+        let cancellation = CaptureCancellation()
+        let backend = FakeBackend(failing: failing, hanging: hanging, onEnter: {
+            if $0 == step { cancellation.cancel() }
+        })
+        final class Box: @unchecked Sendable { var directory: URL? }
+        let box = Box()
+        await #expect(throws: CancellationError.self) {
+            try await summarizedCapture(request) { directory in
+                box.directory = directory
+                try await exportDigitalCapture(
+                    request, to: directory, using: backend, cancellation: cancellation)
+            }
+        }
+        return (backend, try #require(box.directory))
+    }
+
+    @Test("Cancelling during start finishes it, then stops and closes without waiting")
+    func duringStart() async throws {
+        let (backend, directory) = try await runCancelled(at: .start)
+        #expect(await backend.calls == [.start, .stop, .close])
+        #expect(await backend.closedIDs == [42])
+        #expect(!FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    @Test("Cancelling interrupts a wait that would otherwise never end")
+    func duringHungWait() async throws {
+        let (backend, directory) = try await runCancelled(at: .wait, hanging: [.wait])
+        #expect(await backend.calls == [.start, .wait, .stop, .close])
+        #expect(await backend.closedIDs == [42])
+        #expect(!FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    @Test("A wait that ends normally after cancellation does not go on to export")
+    func waitIgnoresCancellation() async throws {
+        let (backend, _) = try await runCancelled(at: .wait)
+        #expect(await backend.calls == [.start, .wait, .stop, .close])
+    }
+
+    @Test("A wait that fails after cancellation reports the cancellation")
+    func waitFailsAfterCancellation() async throws {
+        let (backend, _) = try await runCancelled(at: .wait, failing: [.wait])
+        #expect(await backend.calls == [.start, .wait, .stop, .close])
+    }
+
+    @Test("Cancelling during export finishes it, then closes and reports the cancellation")
+    func duringExport() async throws {
+        let (backend, directory) = try await runCancelled(at: .export)
+        #expect(await backend.calls == [.start, .wait, .export, .stop, .close])
+        #expect(!FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    @Test("Failing cleanup does not hide the cancellation or skip the close")
+    func cleanupFails() async throws {
+        let (backend, directory) = try await runCancelled(
+            at: .wait, failing: [.stop, .close], hanging: [.wait])
+        #expect(await backend.closedIDs == [42])
+        #expect(!FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    @Test("Cancelling before start never touches Logic 2")
+    func beforeStart() async {
+        let cancellation = CaptureCancellation()
+        cancellation.cancel()
+        let backend = FakeBackend()
+        await #expect(throws: CancellationError.self) {
+            try await run(backend, cancellation: cancellation)
+        }
+        #expect(await backend.calls.isEmpty)
+    }
+
+    @Test("Cancelling the task reaches the wait, and cleanup runs uncancelled")
+    func taskCancellation() async throws {
+        let (enteredStream, entered) = AsyncStream<Void>.makeStream()
+        let backend = FakeBackend(hanging: [.wait], onEnter: {
+            if $0 == .wait { entered.yield() }
+        })
+        let directory = Mutex<URL?>(nil)
+        let task = Task {
+            try await withCaptureCancellation { cancellation in
+                try await summarizedCapture(request) { url in
+                    directory.withLock { $0 = url }
+                    try await exportDigitalCapture(
+                        request, to: url, using: backend, cancellation: cancellation)
+                }
+            }
+        }
+        _ = await enteredStream.first { _ in true }
+        task.cancel()
+
+        await #expect(throws: CancellationError.self) { try await task.value }
+        #expect(await backend.calls == [.start, .wait, .stop, .close])
+        #expect(await backend.closeSawCancellation == false)
+        let used = try #require(directory.withLock { $0 })
+        #expect(!FileManager.default.fileExists(atPath: used.path))
+    }
+
+    @Test("A signal cancels the work and restores the previous handler", .serialized, arguments: [SIGINT, SIGTERM])
+    func signalCancels(number: Int32) async {
+        let before = installedHandler(number)
+        let handlerAfterSignal = Mutex(-1)
+        await #expect(throws: CancellationError.self) {
+            try await cancellingOnInterrupt {
+                do {
+                    kill(getpid(), number)
+                    try await Task.sleep(for: .seconds(3600))
+                } catch {
+                    let handler = installedHandler(number)
+                    handlerAfterSignal.withLock { $0 = handler }
+                    throw error
+                }
+            }
+        }
+        #expect(handlerAfterSignal.withLock { $0 } == before)
+    }
+
+    @Test("Interrupted captures use the shell's SIGINT exit code")
+    func exitCode() {
+        #expect(interruptedExitCode == 130)
     }
 }

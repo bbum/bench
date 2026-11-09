@@ -11,8 +11,9 @@ struct DigitalCaptureRequest: Sendable {
 }
 
 /// The Logic 2 calls a capture makes. Tests substitute a fake that fails on demand.
-protocol CaptureBackend {
+protocol CaptureBackend: Sendable {
     func startCapture(_ request: Saleae_Automation_StartCaptureRequest) async throws -> UInt64
+    func stopCapture(_ captureID: UInt64) async throws
     func waitCapture(_ captureID: UInt64) async throws
     func exportBinary(_ request: Saleae_Automation_ExportRawDataBinaryRequest) async throws
     func closeCapture(_ captureID: UInt64) async throws
@@ -23,6 +24,12 @@ struct GRPCCaptureBackend: CaptureBackend {
 
     func startCapture(_ request: Saleae_Automation_StartCaptureRequest) async throws -> UInt64 {
         try await manager.startCapture(request).captureInfo.captureID
+    }
+
+    func stopCapture(_ captureID: UInt64) async throws {
+        var stop = Saleae_Automation_StopCaptureRequest()
+        stop.captureID = captureID
+        _ = try await manager.stopCapture(stop)
     }
 
     func waitCapture(_ captureID: UInt64) async throws {
@@ -46,10 +53,13 @@ func runDigitalCapture(
     _ request: DigitalCaptureRequest,
     endpoint: Logic2Endpoint
 ) async throws -> CaptureSummary {
-    try await summarizedCapture(request) { directory in
-        try await withLogic2(endpoint) { manager in
-            try await exportDigitalCapture(
-                request, to: directory, using: GRPCCaptureBackend(manager: manager))
+    try await withCaptureCancellation { cancellation in
+        try await summarizedCapture(request) { directory in
+            try await withLogic2(endpoint) { manager in
+                try await exportDigitalCapture(
+                    request, to: directory, using: GRPCCaptureBackend(manager: manager),
+                    cancellation: cancellation)
+            }
         }
     }
 }
@@ -70,10 +80,14 @@ func summarizedCapture(
 
 /// Runs a timed capture and writes binary exports to `directory`. Once a capture has
 /// started it is closed on every path, because Logic 2 holds it in memory until then.
+///
+/// Cancellation interrupts only the wait. Start and export run to completion, so a
+/// started capture is never lost and Logic 2 is never left writing into a removed directory.
 func exportDigitalCapture(
     _ request: DigitalCaptureRequest,
     to directory: URL,
-    using backend: some CaptureBackend
+    using backend: some CaptureBackend,
+    cancellation: CaptureCancellation
 ) async throws {
     var logicChannels = Saleae_Automation_LogicChannels()
     logicChannels.digitalChannels = request.channels
@@ -91,10 +105,11 @@ func exportDigitalCapture(
     start.logicDeviceConfiguration = device
     start.captureConfiguration.timedCaptureMode = timed
 
+    try cancellation.checkCancelled()
     let captureID = try await backend.startCapture(start)
 
     do {
-        try await backend.waitCapture(captureID)
+        try await cancellation.interruptible { try await backend.waitCapture(captureID) }
 
         var export = Saleae_Automation_ExportRawDataBinaryRequest()
         export.captureID = captureID
@@ -103,8 +118,10 @@ func exportDigitalCapture(
         // The server requires this even for digital-only exports.
         export.analogDownsampleRatio = 1
         try await backend.exportBinary(export)
+        try cancellation.checkCancelled()
     } catch {
-        // The original failure is the one worth reporting.
+        // Cleanup is best effort. The original failure is the one worth reporting.
+        if cancellation.isCancelled { try? await backend.stopCapture(captureID) }
         try? await backend.closeCapture(captureID)
         throw error
     }

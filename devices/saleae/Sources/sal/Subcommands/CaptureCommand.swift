@@ -41,7 +41,16 @@ struct CaptureCommand: AsyncParsableCommand {
             levelVolts: level,
             deviceID: device
         )
-        let summary = try await runDigitalCapture(request, endpoint: logic2.endpoint)
+        let endpoint = logic2.endpoint
+        let summary: CaptureSummary
+        do {
+            summary = try await cancellingOnInterrupt {
+                try await runDigitalCapture(request, endpoint: endpoint)
+            }
+        } catch is CancellationError {
+            FileHandle.standardError.write(Data("Capture cancelled\n".utf8))
+            throw ExitCode(interruptedExitCode)
+        }
 
         if json {
             let encoder = JSONEncoder()
@@ -53,6 +62,9 @@ struct CaptureCommand: AsyncParsableCommand {
         }
     }
 }
+
+/// The shell convention for a process ended by SIGINT.
+let interruptedExitCode: Int32 = 130
 
 /// Highest channel index on any Saleae device. Bounds ranges before they are expanded.
 private let maximumChannel: UInt32 = 15
