@@ -18,14 +18,17 @@ struct IdentifyCommand: AsyncParsableCommand {
     @Flag(help: "Print JSON instead of a table.")
     var json = false
 
-    func run() async throws {
+    func execute(handlingSignals: Bool) async throws -> ChannelIdentification {
         let confirm = !noConfirm
         let endpoint = capture.logic2.endpoint
         let digital = try resolvedChannels(channels, loading: capture.load != nil)
-        let identification = try await capture.perform(channels: digital) { request in
+        return try await capture.perform(channels: digital, handlingSignals: handlingSignals) { request in
             try await runIdentify(request, confirm: confirm, endpoint: endpoint)
         }
+    }
 
+    func run() async throws {
+        let identification = try await execute(handlingSignals: true)
         if json {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

@@ -13,6 +13,7 @@ test:
 
 # End-to-end check against real hardware. Needs Logic 2 and the testgen board.
 verify:
+	swift build
 	SAL_LIVE=1 swift test --filter LiveTests
 
 # Injects bugs one at a time and requires the offline tests to catch each one.
@@ -21,6 +22,7 @@ mutation:
 
 # Region coverage of hand-written code, including the live tests.
 coverage:
+	swift build
 	SAL_LIVE=1 swift test --enable-code-coverage
 	xcrun llvm-cov report \
 		.build/debug/salTests.xctest/Contents/MacOS/salTests \

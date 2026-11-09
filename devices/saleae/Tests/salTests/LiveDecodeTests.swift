@@ -41,6 +41,117 @@ private func inScratch<Result>(_ body: (URL) async throws -> Result) async throw
     return try await body(directory)
 }
 
+/// A real `sal mcp` subprocess, driven the way a client drives it.
+private final class MCPProcess: @unchecked Sendable {
+    struct Reply {
+        var raw: Data
+        var value: JSONValue
+    }
+
+    private let process = Process()
+    private let input = Pipe()
+    private let output = Pipe()
+    private let lock = NSLock()
+    private var buffer = Data()
+
+    init() throws {
+        // `make verify` and `make coverage` build this first, so it is never stale.
+        process.executableURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent(".build/debug/sal")
+        process.arguments = ["mcp"]
+        process.standardInput = input
+        process.standardOutput = output
+        output.fileHandleForReading.readabilityHandler = { [lock] handle in
+            let chunk = handle.availableData
+            lock.withLock { self.buffer.append(chunk) }
+        }
+        try process.run()
+    }
+
+    func send(_ line: String) throws {
+        try input.fileHandleForWriting.write(contentsOf: Data((line + "\n").utf8))
+    }
+
+    private func lines() -> [Data] {
+        lock.withLock { buffer.split(separator: 0x0A).map { Data($0) } }
+    }
+
+    func hasResponse(id: Int) -> Bool {
+        lines().contains { (try? JSONDecoder().decode(JSONValue.self, from: $0))?["id"] == .int(id) }
+    }
+
+    func request(_ line: String, id: Int, timeout: Double = 20) throws -> Reply {
+        try send(line)
+        return try wait(id: id, timeout: timeout)
+    }
+
+    private func wait(id: Int, timeout: Double) throws -> Reply {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            for line in lines() {
+                if let value = try? JSONDecoder().decode(JSONValue.self, from: line), value["id"] == .int(id) {
+                    return Reply(raw: line, value: value)
+                }
+            }
+            usleep(10_000)
+        }
+        throw TestgenPortError(description: "no MCP response to request \(id)")
+    }
+
+    func tool(_ id: Int, _ name: String, _ arguments: String, timeout: Double = 30) throws -> JSONValue {
+        let reply = try request(
+            #"{"jsonrpc":"2.0","id":\#(id),"method":"tools/call","params":{"name":"\#(name)","arguments":\#(arguments)}}"#,
+            id: id, timeout: timeout)
+        guard case .array(let content)? = reply.value["result"]?["content"], let text = content.first?["text"]?.stringValue,
+            reply.value["result"]?["isError"] == nil
+        else {
+            throw TestgenPortError(description: "tool \(name) failed: \(String(decoding: reply.raw, as: UTF8.self))")
+        }
+        return try JSONDecoder().decode(JSONValue.self, from: Data(text.utf8))
+    }
+
+    func closeInputAndWait() {
+        try? input.fileHandleForWriting.close()
+        process.waitUntilExit()
+    }
+
+    func close() {
+        closeInputAndWait()
+    }
+}
+
+private extension JSONValue {
+    var arrayCount: Int? {
+        if case .array(let values) = self { values.count } else { nil }
+    }
+
+    /// Follows object keys and array indices to a number, or infinity if it is not there.
+    func number(_ path: Any...) -> Double {
+        var current: JSONValue? = self
+        for step in path {
+            if let key = step as? String {
+                current = current?[key]
+            } else if let index = step as? Int, case .array(let values)? = current, values.indices.contains(index) {
+                current = values[index]
+            } else {
+                current = nil
+            }
+        }
+        switch current {
+        case .double(let value)?: return value
+        case .int(let value)?: return Double(value)
+        default: return .infinity
+        }
+    }
+
+    /// Strings at `field` in each element of the array at `key`, also looking inside `fields`.
+    func strings(_ key: String, _ field: String) -> [String] {
+        guard case .array(let values)? = self[key] else { return [] }
+        return values.compactMap { $0[field]?.stringValue ?? $0["fields"]?[field]?.stringValue }
+    }
+}
+
 private struct RandomUART: CustomStringConvertible {
     var baud: Int
     var parity: Parity
@@ -792,6 +903,84 @@ extension LiveTests {
             #expect(FileManager.default.fileExists(atPath: table))
             #expect(FileManager.default.fileExists(atPath: legacy))
         }
+    }
+
+    @Test("The tool list through a real server is small")
+    func mcpList() async throws {
+        let server = try MCPProcess()
+        defer { server.close() }
+        let reply = try server.request(#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, id: 1)
+        #expect(reply.raw.count < 20_000, "\(reply.raw.count) bytes")
+    }
+
+    @Test("Known answers come back through a real MCP server")
+    func mcpKnownAnswers() async throws {
+        let server = try MCPProcess()
+        defer { server.close() }
+
+        _ = try server.request(#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#, id: 1)
+        try server.send(#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+
+        let status = try server.tool(2, "status", "{}")
+        #expect(status["devices"]?.arrayCount == 1)
+
+        let capture = try server.tool(3, "capture", #"{"channels":"0-1","analog":"0","duration":0.03}"#)
+        #expect(abs(capture.number("channels", 0, "periodic", "frequencyHz") - 1000) < 15)
+        #expect(abs(capture.number("analog", 0, "periodic", "dutyPercent") - 25) < 3)
+        #expect(abs(capture.number("analog", 0, "levels", "highVolts") - 3.3) < 0.3)
+
+        let uartRows = try server.tool(4, "decode", #"{"bus":{"protocol":"uart","channel":2,"baud":115200},"duration":0.1,"radix":"ascii"}"#)
+        #expect(uartRows.strings("rows", "data").joined().contains("TESTGEN UART\n"))
+
+        let spiRows = try server.tool(5, "decode", #"{"bus":{"protocol":"spi","clock":3,"mosi":4,"enable":5},"duration":0.1}"#)
+        #expect(contains(spiRows.strings("rows", "mosi"), ["0xA5", "0x5A", "0x00", "0xFF", "0x12", "0x34"]))
+
+        let i2cRows = try server.tool(6, "decode", #"{"bus":{"protocol":"i2c","sda":6,"scl":7},"duration":0.1}"#)
+        #expect(contains(i2cRows.strings("rows", "data"), ["0xDE", "0xAD", "0xBE", "0xEF"]))
+        #expect(i2cRows["issues"] == .object([:]))
+
+        let paged = try server.tool(7, "decode", #"{"bus":{"protocol":"i2c","sda":6,"scl":7},"duration":0.1,"offset":2,"limit":3}"#)
+        #expect(paged["rows"]?.arrayCount == 3)
+        #expect(paged["offset"] == .int(2))
+
+        let wiring = try server.tool(8, "identify", #"{"duration":0.2}"#)
+        #expect(wiring["buses"]?.arrayCount == 3)
+        #expect(wiring.strings("buses", "confidence") == ["confirmed", "confirmed", "confirmed"])
+        #expect(wiring.strings("buses", "command").contains("sal decode i2c --sda 6 --scl 7"))
+    }
+
+    @Test("Bad input through a real server is a readable tool error")
+    func mcpBadInput() async throws {
+        let server = try MCPProcess()
+        defer { server.close() }
+        let reply = try server.request(
+            #"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"capture","arguments":{"duration":0}}}"#, id: 1)
+        #expect(reply.value["result"]?["isError"] == .bool(true))
+    }
+
+    @Test("Cancelling a long capture through a real server ends it, and the next call is clean")
+    func mcpCancel() async throws {
+        let server = try MCPProcess()
+        defer { server.close() }
+        try server.send(#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"capture","arguments":{"duration":60,"channels":"0"}}}"#)
+        try await Task.sleep(for: .seconds(2))
+        try server.send(#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#)
+
+        let next = try server.tool(2, "capture", #"{"channels":"0","duration":0.05}"#, timeout: 15)
+        #expect(abs(next.number("channels", 0, "periodic", "frequencyHz") - 1000) < 15)
+        #expect(server.hasResponse(id: 1) == false)
+    }
+
+    @Test("Closing stdin during a capture ends the server, and the next capture is clean")
+    func mcpDisconnect() async throws {
+        let server = try MCPProcess()
+        try server.send(#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"capture","arguments":{"duration":60,"channels":"0"}}}"#)
+        try await Task.sleep(for: .seconds(2))
+        let clock = ContinuousClock()
+        let closed = clock.now
+        server.closeInputAndWait()
+        #expect(clock.now - closed < .seconds(15))
+        _ = try await runDigitalCapture(analogFreeCapture(channels: [0]), endpoint: Logic2Endpoint())
     }
 
     @Test("The decode commands run in both output modes", arguments: [

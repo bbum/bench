@@ -79,20 +79,7 @@ struct DecodeOptions: ParsableArguments {
     }
 
     func run(_ decoder: ProtocolDecoder) async throws {
-        let radix = radix
-        let highLevel = highLevelRequest
-        let tableExport = tableExportRequest
-        let legacyPath = exportLegacy.map(absolutePath)
-        let endpoint = capture.logic2.endpoint
-        let rows = try await capture.perform(channels: decoder.channels) { request in
-            try await runDecode(
-                DecodeRequest(
-                    capture: request, decoder: decoder, radix: radix, highLevel: highLevel, tableExport: tableExport,
-                    legacyPath: legacyPath),
-                endpoint: endpoint)
-        }
-        let page = decodePage(rows, offset: offset, limit: limit)
-
+        let page = try await execute(decoder, handlingSignals: true)
         if json {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -102,6 +89,28 @@ struct DecodeOptions: ParsableArguments {
             print(pageFooter(page))
         }
     }
+
+    func execute(_ decoder: ProtocolDecoder, handlingSignals: Bool) async throws -> DecodePage {
+        let radix = radix
+        let highLevel = highLevelRequest
+        let tableExport = tableExportRequest
+        let legacyPath = exportLegacy.map(absolutePath)
+        let endpoint = capture.logic2.endpoint
+        let rows = try await capture.perform(channels: decoder.channels, handlingSignals: handlingSignals) { request in
+            try await runDecode(
+                DecodeRequest(
+                    capture: request, decoder: decoder, radix: radix, highLevel: highLevel, tableExport: tableExport,
+                    legacyPath: legacyPath),
+                endpoint: endpoint)
+        }
+        return decodePage(rows, offset: offset, limit: limit)
+    }
+}
+
+/// A decode subcommand, however its protocol is configured.
+protocol DecodeInvocation {
+    var options: DecodeOptions { get }
+    var protocolDecoder: ProtocolDecoder { get }
 }
 
 func validateChannels(_ channels: [UInt32]) throws {
@@ -116,7 +125,7 @@ func validateWordBits(_ bits: Int) throws {
     }
 }
 
-struct UARTCommand: AsyncParsableCommand {
+struct UARTCommand: AsyncParsableCommand, DecodeInvocation {
     static let configuration = CommandConfiguration(
         commandName: "uart", abstract: "Decode asynchronous serial.")
 
@@ -156,6 +165,8 @@ struct UARTCommand: AsyncParsableCommand {
         try await options.run(.uart(decoder))
     }
 
+    var protocolDecoder: ProtocolDecoder { .uart(decoder) }
+
     var decoder: UARTDecoder {
         UARTDecoder(
             channel: channel, baud: baud, bits: bits, parity: parity, stop: stop, order: order,
@@ -163,7 +174,7 @@ struct UARTCommand: AsyncParsableCommand {
     }
 }
 
-struct SPICommand: AsyncParsableCommand {
+struct SPICommand: AsyncParsableCommand, DecodeInvocation {
     static let configuration = CommandConfiguration(
         commandName: "spi", abstract: "Decode SPI. Needs a clock and at least one data line.")
 
@@ -209,6 +220,8 @@ struct SPICommand: AsyncParsableCommand {
         try await options.run(.spi(decoder))
     }
 
+    var protocolDecoder: ProtocolDecoder { .spi(decoder) }
+
     var decoder: SPIDecoder {
         SPIDecoder(
             clock: clock, mosi: mosi, miso: miso, enable: enable, bits: bits, order: order,
@@ -216,7 +229,7 @@ struct SPICommand: AsyncParsableCommand {
     }
 }
 
-struct I2CCommand: AsyncParsableCommand {
+struct I2CCommand: AsyncParsableCommand, DecodeInvocation {
     static let configuration = CommandConfiguration(commandName: "i2c", abstract: "Decode I2C.")
 
     @OptionGroup var options: DecodeOptions
@@ -234,6 +247,8 @@ struct I2CCommand: AsyncParsableCommand {
     func run() async throws {
         try await options.run(.i2c(I2CDecoder(sda: sda, scl: scl)))
     }
+
+    var protocolDecoder: ProtocolDecoder { .i2c(I2CDecoder(sda: sda, scl: scl)) }
 }
 
 func describe(_ row: DecodedRow) -> String {

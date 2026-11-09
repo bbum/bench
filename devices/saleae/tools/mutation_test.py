@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 
+TEST_TIMEOUT_SECONDS = 300
 ROOT = pathlib.Path("Sources/sal")
 CHANNEL = ROOT / "Analysis/DigitalChannel.swift"
 SUMMARY = ROOT / "Analysis/ChannelSummary.swift"
@@ -24,6 +25,8 @@ MODE = ROOT / "Logic2/CaptureMode.swift"
 OPTIONS = ROOT / "Subcommands/CaptureOptions.swift"
 IDENTIFY = ROOT / "Analysis/ChannelIdentification.swift"
 ANALOG = ROOT / "Analysis/AnalogChannel.swift"
+SERVER = ROOT / "MCP/MCPServer.swift"
+TOOLS = ROOT / "MCP/SalTools.swift"
 
 MUTANTS = [
     (CHANNEL, "guard version == 0 else", "guard version >= 0 else"),
@@ -154,6 +157,18 @@ MUTANTS = [
     (DECODERS, "if let number = Double(text), number.isFinite {", "if let number = Double(text) {"),
     (DECODE, "guard (hla == nil) == (hlaExtension == nil) else", "guard true else"),
     (DECODE, "guard hla != nil || hlaSetting.isEmpty else", "guard true else"),
+    (SERVER, 'if request.method == "notifications/cancelled" {', "if false {"),
+    (SERVER, "running.values.forEach { $0.cancel() }", ""),
+    (SERVER, "await previous?.value", ""),
+    (SERVER, "Task.isCancelled ? nil : result", "result"),
+    (SERVER, "guard !Task.isCancelled else { return nil }", ""),
+    (SERVER, 'if isError { result["isError"] = .bool(true) }', ""),
+    (SERVER, 'params?["protocolVersion"] ?? .string("2024-11-05")', '.string("2024-11-05")'),
+    (SERVER, "if byte == 0x0A {", "if byte == 0x0A || byte == 0x0D {"),
+    (TOOLS, "guard allowed.contains(key) else", "guard true else"),
+    (TOOLS, 'line.append("\\(flag)=\\(try scalarText(value, key: key))")', 'line.append(flag); line.append(try scalarText(value, key: key))'),
+    (TOOLS, 'if arguments["manual"] == .bool(true), arguments["duration"] == nil {', "if false {"),
+    (TOOLS, 'if arguments["limit"] == nil { line.append("--limit=\\(defaultToolRowLimit)") }', ""),
     (MAIN, "guard !devices.isEmpty else", "guard devices.isEmpty else"),
 ]
 
@@ -168,9 +183,11 @@ def caught_by_tests() -> bool:
         start_new_session=True,
     ) as process:
         try:
-            return process.wait(timeout=300) != 0
+            return process.wait(timeout=TEST_TIMEOUT_SECONDS) != 0
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGKILL)
+            # The test helper leaves the process group, so it is found by its bundle path.
+            subprocess.run(["pkill", "-9", "-f", f"swiftpm-testing-helper.*{pathlib.Path.cwd()}/"])
             return True
 
 

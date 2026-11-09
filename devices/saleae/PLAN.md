@@ -39,13 +39,9 @@ data table and legacy exports, and high level analyzers. Saving and reloading gi
 identical summary, and Logic 2's own CSV matches the binary parser. Uses 14 of the 16
 RPCs. The two left remove an analyzer, which a capture that closes when done never needs.
 
-## Phase 7: MCP server
-
-Our own server over the same functions as the CLI: a small tool list, real enums and
-`oneOf`, and results returned inline. Can move earlier if an agent needs `sal` sooner.
-
-- Proof: the same known answers through the MCP interface. Measure the tool list size
-  against Saleae's 168 KB.
+Phase 7, MCP server: `sal mcp` offers `status`, `capture`, `decode` and `identify`, using
+the CLI's own parsing. Its tool list is about 10 KB against 168 KB for Saleae's server.
+Cancellation reaches a running capture, and a closed client cannot leave one running.
 
 ## Phase 8: Cross-channel analysis
 

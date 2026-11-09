@@ -7,7 +7,8 @@ Status: `sal status`, `sal capture` (digital capture with a per-channel summary)
 `sal decode uart|spi|i2c` (decoded rows with paging and issue counts) work, with timed,
 manual and trigger captures and glitch filters. `sal identify` works out what is on
 each channel, and `sal capture --analog` records analog with levels and duty. Every
-capturing command can `--save` to and `--load` from a `.sal` file. MCP is not built yet. See PLAN.md for the phases.
+capturing command can `--save` to and `--load` from a `.sal` file. `sal mcp` serves
+these as MCP tools. See PLAN.md for the phases.
 
 ## Build
 
@@ -17,6 +18,7 @@ make test        # offline, uses a recorded testgen capture; about 40 s
 make verify      # live end-to-end check; needs Logic 2 and testgen on USB
 make build       # release
 make install     # release -> ~/.local/bin/sal
+sal mcp          # MCP server over stdio
 make proto       # regenerate Sources/sal/Generated; needs protoc
 ```
 
@@ -88,6 +90,9 @@ Tested the way SQLite is. New parsing or analysis code ships with all of these:
   create directories for raw CSV exports.
 - A loaded capture has no channel list, so `sal` exports without one and reads which
   channels exist from the file names. Naming a channel the file lacks is an error.
+- MCP tools turn their arguments into a command line and go through the CLI's parser, so
+  a new option needs a schema entry and an allowed key. Tests check every schema key is a
+  real flag. Keep `oneOf` nested, because Claude's API rejects it at the top of a schema.
 - Adding an analyzer takes almost a second, so live tests should not add many.
 - The deployment target is macOS 27.0 because the current toolchain rejects 27.2.
 - Binary exports: this Logic Pro 8 on Logic 2.4.48 produces format V0 (confirmed by

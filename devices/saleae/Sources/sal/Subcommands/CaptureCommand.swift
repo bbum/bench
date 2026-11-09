@@ -51,15 +51,7 @@ struct CaptureCommand: AsyncParsableCommand {
     }
 
     func run() async throws {
-        let endpoint = capture.logic2.endpoint
-        let digital = try resolvedChannels(channels, loading: capture.load != nil)
-        let rawCSV = exportCsv.map { RawCSVExport(directory: absolutePath($0), iso8601: iso8601) }
-        let summary = try await capture.perform(channels: digital, analog: try analogCapture) { request in
-            var request = request
-            request.rawCSV = rawCSV
-            return try await runDigitalCapture(request, endpoint: endpoint)
-        }
-
+        let summary = try await execute(handlingSignals: true)
         if json {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -68,6 +60,17 @@ struct CaptureCommand: AsyncParsableCommand {
             print("\(formatSeconds(summary.durationSeconds)) captured")
             summary.channels.forEach { print(describe($0)) }
             summary.analog.forEach { print(describe($0)) }
+        }
+    }
+
+    func execute(handlingSignals: Bool) async throws -> CaptureSummary {
+        let endpoint = capture.logic2.endpoint
+        let digital = try resolvedChannels(channels, loading: capture.load != nil)
+        let rawCSV = exportCsv.map { RawCSVExport(directory: absolutePath($0), iso8601: iso8601) }
+        return try await capture.perform(channels: digital, analog: try analogCapture, handlingSignals: handlingSignals) { request in
+            var request = request
+            request.rawCSV = rawCSV
+            return try await runDigitalCapture(request, endpoint: endpoint)
         }
     }
 }

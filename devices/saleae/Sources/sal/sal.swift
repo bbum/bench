@@ -16,7 +16,7 @@ struct Sal: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "sal",
         abstract: "Drive Saleae logic analyzers through Logic 2's automation server.",
-        subcommands: [Status.self, CaptureCommand.self, DecodeCommand.self, IdentifyCommand.self]
+        subcommands: [Status.self, CaptureCommand.self, DecodeCommand.self, IdentifyCommand.self, MCPCommand.self]
     )
 }
 
@@ -28,16 +28,39 @@ struct Status: AsyncParsableCommand {
     @OptionGroup var logic2: Logic2Options
 
     func run() async throws {
-        var options = CallOptions.defaults
-        options.timeout = .seconds(5)
-        let callOptions = options
-
         try await withLogic2(logic2.endpoint) { manager in
-            let app = try await manager.getAppInfo(.init(), options: callOptions).appInfo
-            let devices = try await manager.getDevices(.init(), options: callOptions).devices
+            let (app, devices) = try await query(manager)
             statusLines(app: app, devices: devices).forEach { print($0) }
         }
     }
+
+    func information() async throws -> StatusInformation {
+        try await withLogic2(logic2.endpoint) { manager in
+            let (app, devices) = try await query(manager)
+            let api = app.apiVersion
+            return StatusInformation(
+                logicVersion: app.applicationVersion, apiVersion: "\(api.major).\(api.minor).\(api.patch)",
+                devices: devices.map { StatusInformation.Device(type: "\($0.deviceType)", id: $0.deviceID) })
+        }
+    }
+
+    private func query(_ manager: Logic2Manager) async throws -> (Saleae_Automation_AppInfo, [Saleae_Automation_Device]) {
+        var options = CallOptions.defaults
+        options.timeout = .seconds(5)
+        let app = try await manager.getAppInfo(.init(), options: options).appInfo
+        return (app, try await manager.getDevices(.init(), options: options).devices)
+    }
+}
+
+struct StatusInformation: Encodable, Sendable {
+    struct Device: Encodable, Sendable {
+        var type: String
+        var id: String
+    }
+
+    var logicVersion: String
+    var apiVersion: String
+    var devices: [Device]
 }
 
 func statusLines(

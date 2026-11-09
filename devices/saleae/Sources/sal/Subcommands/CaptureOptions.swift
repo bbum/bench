@@ -132,10 +132,12 @@ struct CaptureOptions: ParsableArguments {
     func perform<Result: Sendable>(
         channels: [UInt32],
         analog: AnalogCapture? = nil,
+        handlingSignals: Bool = true,
         body: @escaping @Sendable (DigitalCaptureRequest) async throws -> Result
     ) async throws -> Result {
         let stop = CaptureCancellation()
         let built = try request(channels: channels, analog: analog, stop: stop)
+        guard handlingSignals else { return try await body(built) }
         if manual && duration == nil {
             FileHandle.standardError.write(Data("Capturing until Ctrl-C\n".utf8))
         }
