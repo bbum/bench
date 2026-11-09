@@ -92,7 +92,7 @@ private func copyFixtures(to directory: URL) throws {
 }
 
 private let request = DigitalCaptureRequest(
-    channels: Array(0...7), sampleRate: 50_000_000, durationSeconds: 0.5, levelVolts: 3.3, deviceID: "ABC")
+    channels: Array(0...7), sampleRate: 50_000_000, mode: .timed(seconds: 0.5), levelVolts: 3.3, deviceID: "ABC")
 
 /// Runs a capture, reporting the directory it used so cleanup can be checked.
 private func run(
@@ -253,7 +253,7 @@ private func installedHandler(_ number: Int32) -> Int {
     return unsafeBitCast(current.__sigaction_u.__sa_handler, to: Int.self)
 }
 
-@Suite("Cancellation")
+@Suite("Cancellation", .serialized)
 struct CancellationTests {
     /// Runs a capture that is cancelled on entering `step`, returning the temp directory.
     private func runCancelled(
@@ -376,6 +376,17 @@ struct CancellationTests {
         #expect(handlerAfterSignal.withLock { $0 } == before)
     }
 
+    @Test("An interrupt can stop instead of cancelling")
+    func interruptCallsHandler() async throws {
+        let stop = CaptureCancellation()
+        let result = try await cancellingOnInterrupt(interrupt: { stop.cancel() }) {
+            kill(getpid(), SIGINT)
+            while !stop.isCancelled { try await Task.sleep(for: .milliseconds(1)) }
+            return Task.isCancelled
+        }
+        #expect(result == false)
+    }
+
     @Test("Interrupted captures use the shell's SIGINT exit code")
     func exitCode() {
         #expect(interruptedExitCode == 130)
@@ -384,7 +395,7 @@ struct CancellationTests {
 
 private let decodeRequest = DecodeRequest(
     capture: DigitalCaptureRequest(
-        channels: [2], sampleRate: 50_000_000, durationSeconds: 0.5, levelVolts: 3.3, deviceID: nil),
+        channels: [2], sampleRate: 50_000_000, mode: .timed(seconds: 0.5), levelVolts: 3.3, deviceID: nil),
     decoder: .uart(UARTDecoder(channel: 2, baud: 115_200)),
     radix: .dec)
 
@@ -453,6 +464,144 @@ struct DecodeFaultInjectionTests {
         await backend.setTable(Data("garbage\n".utf8))
         await #expect(throws: DecodedTableError.invalidHeader) { try await decode(backend) }
         #expect(await backend.closedIDs == [42])
+    }
+}
+
+private func captureRequest(_ mode: CaptureMode) -> DigitalCaptureRequest {
+    DigitalCaptureRequest(channels: Array(0...7), sampleRate: 50_000_000, mode: mode, levelVolts: 3.3, deviceID: nil)
+}
+
+@Suite("Capture modes", .serialized)
+struct CaptureModeFlowTests {
+    private func capture(
+        _ backend: FakeBackend,
+        _ mode: CaptureMode,
+        cancellation: CaptureCancellation = CaptureCancellation()
+    ) async throws -> CaptureSummary {
+        let capture = captureRequest(mode)
+        return try await summarizedCapture(capture) { directory in
+            try await exportDigitalCapture(capture, to: directory, using: backend, cancellation: cancellation)
+        }
+    }
+
+    private let trigger = DigitalTrigger(
+        point: TriggerPoint(channel: 1, kind: .rising), afterSeconds: 0.01, timeoutSeconds: 0.05)
+
+    @Test("A manual capture stops at its limit, and is never waited on")
+    func manualLimit() async throws {
+        let backend = FakeBackend()
+        let clock = ContinuousClock()
+        let began = clock.now
+        try Testgen.verify(try await capture(backend, .manual(limitSeconds: 0.05, stop: CaptureCancellation())))
+        #expect(clock.now - began >= .milliseconds(50))
+        #expect(await backend.calls == [.start, .stop, .export, .close])
+    }
+
+    @Test("Stopping a manual capture ends it early and keeps the data")
+    func manualStop() async throws {
+        let stop = CaptureCancellation()
+        let backend = FakeBackend(onEnter: { if $0 == .start { stop.cancel() } })
+        try Testgen.verify(try await capture(backend, .manual(limitSeconds: nil, stop: stop)))
+        #expect(await backend.calls == [.start, .stop, .export, .close])
+    }
+
+    @Test("Cancelling a manual capture discards it")
+    func manualCancelled() async {
+        let cancellation = CaptureCancellation()
+        let backend = FakeBackend(onEnter: { if $0 == .start { cancellation.cancel() } })
+        await #expect(throws: CancellationError.self) {
+            try await capture(backend, .manual(limitSeconds: nil, stop: CaptureCancellation()), cancellation: cancellation)
+        }
+        #expect(await backend.calls == [.start, .stop, .close])
+    }
+
+    @Test("Cancelling reaches a manual capture that is already holding")
+    func manualCancelledWhileHolding() async {
+        let cancellation = CaptureCancellation()
+        let backend = FakeBackend()
+        let task = Task {
+            try await capture(backend, .manual(limitSeconds: nil, stop: CaptureCancellation()), cancellation: cancellation)
+        }
+        while await backend.calls.isEmpty { await Task.yield() }
+        try? await Task.sleep(for: .milliseconds(20))
+        cancellation.cancel()
+        await #expect(throws: CancellationError.self) { try await task.value }
+    }
+
+    @Test("A failed manual stop is reported and the capture closed")
+    func manualStopFails() async {
+        let backend = FakeBackend(failing: [.stop])
+        await #expect(throws: InjectedFault.self) {
+            try await capture(backend, .manual(limitSeconds: 0.001, stop: CaptureCancellation()))
+        }
+        #expect(await backend.calls == [.start, .stop, .close])
+    }
+
+    @Test("A trigger that fires is waited on, and not stopped")
+    func triggerFires() async throws {
+        let backend = FakeBackend()
+        try Testgen.verify(try await capture(backend, .trigger(trigger)))
+        #expect(await backend.calls == [.start, .wait, .export, .close])
+    }
+
+    @Test("A trigger that never fires times out, then stops and closes")
+    func triggerTimesOut() async {
+        let backend = FakeBackend(hanging: [.wait])
+        await #expect(throws: CaptureError.triggerTimeout(seconds: 0.05)) {
+            try await capture(backend, .trigger(trigger))
+        }
+        #expect(await backend.calls == [.start, .wait, .stop, .close])
+    }
+
+    @Test("A failing stop after a timeout still reports the timeout and closes")
+    func timeoutStopFails() async {
+        let backend = FakeBackend(failing: [.stop], hanging: [.wait])
+        await #expect(throws: CaptureError.triggerTimeout(seconds: 0.05)) {
+            try await capture(backend, .trigger(trigger))
+        }
+        #expect(await backend.closedIDs == [42])
+    }
+
+    @Test("The timeout allows for the capture after the trigger")
+    func timeoutIncludesAfter() async throws {
+        var long = trigger
+        long.afterSeconds = 0.2
+        let backend = FakeBackend(onEnter: {
+            if $0 == .wait { try? await Task.sleep(for: .milliseconds(120)) }
+        })
+        try Testgen.verify(try await capture(backend, .trigger(long)))
+    }
+
+    @Test("Cancelling while waiting for a trigger reports the cancellation")
+    func triggerCancelled() async {
+        let cancellation = CaptureCancellation()
+        let backend = FakeBackend(hanging: [.wait], onEnter: { if $0 == .wait { cancellation.cancel() } })
+        var long = trigger
+        long.timeoutSeconds = 3600
+        await #expect(throws: CancellationError.self) {
+            try await capture(backend, .trigger(long), cancellation: cancellation)
+        }
+        #expect(await backend.calls == [.start, .wait, .stop, .close])
+    }
+
+    @Test("A failed wait on a trigger is reported unchanged")
+    func triggerWaitFails() async {
+        let backend = FakeBackend(failing: [.wait])
+        await #expect(throws: InjectedFault.self) { try await capture(backend, .trigger(trigger)) }
+        #expect(await backend.calls == [.start, .wait, .close])
+    }
+
+    @Test("Every failing step in every mode closes at most once")
+    func everyCombination() async {
+        let steps = Step.allCases
+        for mask in 0..<(1 << steps.count) {
+            let failing = Set(steps.indices.filter { mask & (1 << $0) != 0 }.map { steps[$0] })
+            for mode: CaptureMode in [.manual(limitSeconds: 0, stop: CaptureCancellation()), .trigger(trigger)] {
+                let backend = FakeBackend(failing: failing)
+                _ = try? await capture(backend, mode)
+                #expect(await backend.closedIDs.count == (failing.contains(.start) ? 0 : 1), "failing: \(failing)")
+            }
+        }
     }
 }
 

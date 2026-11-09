@@ -10,19 +10,7 @@ struct DecodeCommand: ParsableCommand {
 }
 
 struct DecodeOptions: ParsableArguments {
-    @OptionGroup var logic2: Logic2Options
-
-    @Option(help: "Digital sample rate, such as 50M or 500000.")
-    var rate = "50M"
-
-    @Option(help: "Capture length in seconds.")
-    var duration = 0.5
-
-    @Option(help: "Logic level in volts: 1.2, 1.8 or 3.3.")
-    var level = 3.3
-
-    @Option(help: "Device serial number. Defaults to the first physical device.")
-    var device: String?
+    @OptionGroup var capture: CaptureOptions
 
     @Option(help: "How to show values: hex, dec, bin or ascii.")
     var radix = Radix.hex
@@ -37,26 +25,15 @@ struct DecodeOptions: ParsableArguments {
     var json = false
 
     func validate() throws {
-        guard duration.isFinite, duration > 0 else {
-            throw ValidationError("Duration must be a positive number of seconds.")
-        }
         guard offset >= 0 else { throw ValidationError("Offset cannot be negative.") }
         guard limit > 0 else { throw ValidationError("Limit must be positive.") }
     }
 
     func run(_ decoder: ProtocolDecoder) async throws {
-        let request = DecodeRequest(
-            capture: DigitalCaptureRequest(
-                channels: decoder.channels,
-                sampleRate: try parseSampleRate(rate),
-                durationSeconds: duration,
-                levelVolts: level,
-                deviceID: device),
-            decoder: decoder,
-            radix: radix)
-        let endpoint = logic2.endpoint
-        let rows = try await exitingOnInterrupt {
-            try await runDecode(request, endpoint: endpoint)
+        let radix = radix
+        let endpoint = capture.logic2.endpoint
+        let rows = try await capture.perform(channels: decoder.channels) { request in
+            try await runDecode(DecodeRequest(capture: request, decoder: decoder, radix: radix), endpoint: endpoint)
         }
         let page = decodePage(rows, offset: offset, limit: limit)
 

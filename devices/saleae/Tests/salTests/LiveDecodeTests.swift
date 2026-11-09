@@ -12,9 +12,29 @@ private func decode(_ decoder: ProtocolDecoder, radix: Radix = .hex) async throw
     try await runDecode(
         DecodeRequest(
             capture: DigitalCaptureRequest(
-                channels: decoder.channels, sampleRate: 50_000_000, durationSeconds: 0.12, levelVolts: 3.3,
+                channels: decoder.channels, sampleRate: 50_000_000, mode: .timed(seconds: 0.12), levelVolts: 3.3,
                 deviceID: nil),
             decoder: decoder, radix: radix),
+        endpoint: Logic2Endpoint())
+}
+
+private func decodeTriggered(
+    _ kind: TriggerKind,
+    channel: UInt32 = 1,
+    minimum: Double? = nil,
+    maximum: Double? = nil,
+    linked: [LinkedChannel] = [],
+    timeout: Double = 5
+) async throws -> [DecodedRow] {
+    let trigger = DigitalTrigger(
+        point: TriggerPoint(channel: channel, kind: kind), afterSeconds: 0.05, minimumPulse: minimum.map(Seconds.init),
+        maximumPulse: maximum.map(Seconds.init), linked: linked, timeoutSeconds: timeout)
+    let channels = Array(Set([2, channel] + linked.map(\.channel))).sorted()
+    return try await runDecode(
+        DecodeRequest(
+            capture: DigitalCaptureRequest(
+                channels: channels, sampleRate: 50_000_000, mode: .trigger(trigger), levelVolts: 3.3, deviceID: nil),
+            decoder: .uart(uart)),
         endpoint: Logic2Endpoint())
 }
 
@@ -230,10 +250,10 @@ extension LiveTests {
         decoders.append(.i2c(i2c))
 
         let request = DigitalCaptureRequest(
-            channels: Array(0...7), sampleRate: 50_000_000, durationSeconds: 0.02, levelVolts: 3.3, deviceID: nil)
+            channels: Array(0...7), sampleRate: 50_000_000, mode: .timed(seconds: 0.02), levelVolts: 3.3, deviceID: nil)
         try await withLogic2(Logic2Endpoint()) { manager in
             let backend = GRPCCaptureBackend(manager: manager)
-            try await runTimedCapture(request, using: backend, cancellation: CaptureCancellation()) { captureID in
+            try await runCapture(request, using: backend, cancellation: CaptureCancellation()) { captureID in
                 for decoder in decoders {
                     var add = Saleae_Automation_AddAnalyzerRequest()
                     add.captureID = captureID
@@ -249,6 +269,134 @@ extension LiveTests {
                 }
             }
         }
+    }
+
+    @Test("Traffic follows a rising trigger on the sync channel, at time zero")
+    func triggerFollowsSync() async throws {
+        try await withTestgen(mode: "c") {
+            let rows = try await decodeTriggered(.rising)
+            let after = rows.filter { $0.start >= 0 }
+            let first = try #require(after.first)
+            #expect(first.start < 150e-6, "first row at \(first.start)")
+            #expect(contains(after.prefix(13).compactMap { word($0) }, message))
+        }
+    }
+
+    @Test("A falling trigger works too")
+    func triggerFalling() async throws {
+        try await withTestgen(mode: "c") {
+            let after = try await decodeTriggered(.falling).filter { $0.start >= 0 }
+            #expect(contains(after.prefix(13).compactMap { word($0) }, message))
+        }
+    }
+
+    @Test("A pulse trigger fires inside the sync pulse's width and not outside it")
+    func triggerPulseWindow() async throws {
+        try await withTestgen(mode: "c") {
+            _ = try await decodeTriggered(.high, minimum: 10e-6, maximum: 25e-6)
+            await #expect(throws: CaptureError.triggerTimeout(seconds: 1)) {
+                try await decodeTriggered(.high, minimum: 100e-6, maximum: 200e-6, timeout: 1)
+            }
+        }
+    }
+
+    @Test("A pulse trigger works with no bounds and with only a minimum")
+    func triggerOpenEnded() async throws {
+        try await withTestgen(mode: "c") {
+            _ = try await decodeTriggered(.high)
+            _ = try await decodeTriggered(.high, minimum: 10e-6)
+            await #expect(throws: CaptureError.triggerTimeout(seconds: 1)) {
+                try await decodeTriggered(.high, minimum: 100e-6, timeout: 1)
+            }
+        }
+    }
+
+    @Test("A low pulse trigger matches the chip select frame")
+    func triggerPulseLow() async throws {
+        try await withTestgen(mode: "c") {
+            _ = try await decodeTriggered(.low, channel: 5, minimum: 30e-6, maximum: 70e-6)
+            await #expect(throws: CaptureError.triggerTimeout(seconds: 1)) {
+                try await decodeTriggered(.low, channel: 5, minimum: 1e-6, maximum: 5e-6, timeout: 1)
+            }
+        }
+    }
+
+    @Test("A linked channel gates the trigger on its level")
+    func triggerLinked() async throws {
+        try await withTestgen(mode: "c") {
+            _ = try await decodeTriggered(.rising, linked: [LinkedChannel(channel: 5, isHigh: true)])
+            await #expect(throws: CaptureError.triggerTimeout(seconds: 1)) {
+                try await decodeTriggered(.rising, linked: [LinkedChannel(channel: 5, isHigh: false)], timeout: 1)
+            }
+        }
+    }
+
+    @Test("Glitch filters keep pulses above their width and remove those below", arguments: [
+        (5e-6, true), (25e-6, false),
+    ])
+    func glitchFilter(width: Double, keepsPulses: Bool) async throws {
+        var capture = DigitalCaptureRequest(
+            channels: [1], sampleRate: 50_000_000, mode: .timed(seconds: 0.2), levelVolts: 3.3, deviceID: nil)
+        capture.glitchFilters = [GlitchFilter(channel: 1, width: Seconds(width))]
+        let summary = try await runDigitalCapture(capture, endpoint: Logic2Endpoint())
+        #expect((summary.channels[0].edges > 0) == keepsPulses)
+    }
+
+    @Test("A manual capture runs until its limit")
+    func manualLimit() async throws {
+        let capture = DigitalCaptureRequest(
+            channels: Array(0...7), sampleRate: 50_000_000,
+            mode: .manual(limitSeconds: 1, stop: CaptureCancellation()), levelVolts: 3.3, deviceID: nil)
+        let summary = try await runDigitalCapture(capture, endpoint: Logic2Endpoint())
+        try Testgen.verify(summary)
+        #expect(abs(summary.durationSeconds - 1) < 0.3)
+    }
+
+    @Test("Stopping a manual capture ends it and keeps the data")
+    func manualStop() async throws {
+        let stop = CaptureCancellation()
+        let capture = DigitalCaptureRequest(
+            channels: Array(0...7), sampleRate: 50_000_000,
+            mode: .manual(limitSeconds: nil, stop: stop), levelVolts: 3.3, deviceID: nil)
+        let task = Task { try await runDigitalCapture(capture, endpoint: Logic2Endpoint()) }
+        try await Task.sleep(for: .seconds(1))
+        stop.cancel()
+        let summary = try await task.value
+        try Testgen.verify(summary)
+        #expect(summary.durationSeconds < 2)
+    }
+
+    @Test("Trim keeps only the end of a capture", arguments: [true, false])
+    func trim(manual: Bool) async throws {
+        let mode: CaptureMode = manual
+            ? .manual(limitSeconds: 0.6, trimSeconds: 0.1, stop: CaptureCancellation())
+            : .timed(seconds: 0.6, trimSeconds: 0.1)
+        let capture = DigitalCaptureRequest(
+            channels: [1], sampleRate: 50_000_000, mode: mode, levelVolts: 3.3, deviceID: nil)
+        let summary = try await runDigitalCapture(capture, endpoint: Logic2Endpoint())
+        #expect(abs(summary.durationSeconds - 0.1) < 0.02)
+    }
+
+    @Test("Hitting the buffer limit is reported and the next capture is clean")
+    func bufferLimit() async throws {
+        var capture = DigitalCaptureRequest(
+            channels: [1, 2, 5], sampleRate: 50_000_000, mode: .timed(seconds: 3), levelVolts: 3.3, deviceID: nil)
+        capture.bufferMegabytes = 1
+        let limited = capture
+        await #expect(throws: (any Error).self) {
+            try await runDigitalCapture(limited, endpoint: Logic2Endpoint())
+        }
+        capture.bufferMegabytes = nil
+        capture.mode = .timed(seconds: 0.1)
+        _ = try await runDigitalCapture(capture, endpoint: Logic2Endpoint())
+    }
+
+    @Test("The capture command takes trigger and glitch options")
+    func triggerCommand() async throws {
+        let command = try CaptureCommand.parseAsRoot([
+            "--channels", "1,2", "--trigger", "1:rising", "--duration", "0.05", "--glitch", "2:1us",
+        ]) as! CaptureCommand
+        try await command.run()
     }
 
     @Test("The decode commands run in both output modes", arguments: [
@@ -268,7 +416,7 @@ extension LiveTests {
     func cancelledDecode() async throws {
         let long = DecodeRequest(
             capture: DigitalCaptureRequest(
-                channels: [2], sampleRate: 50_000_000, durationSeconds: 60, levelVolts: 3.3, deviceID: nil),
+                channels: [2], sampleRate: 50_000_000, mode: .timed(seconds: 60), levelVolts: 3.3, deviceID: nil),
             decoder: .uart(uart))
         let task = Task { try await runDecode(long, endpoint: Logic2Endpoint()) }
         try await Task.sleep(for: .seconds(2))

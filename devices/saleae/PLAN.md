@@ -23,12 +23,8 @@ issue counts. `testgen` selects each format and fault over USB serial. Logic 2 f
 framing and parity errors but reports nothing for a wrong baud rate, so phase 4 has to
 work that out from timing.
 
-## Phase 3: Capture modes
-
-Digital trigger captures, manual start and stop, and glitch filters.
-
-- Proof: trigger on the sync channel and check that traffic follows it. Filter below and
-  above a known pulse width.
+Phase 3, capture modes: digital triggers with pulse widths and linked channels, manual
+capture, glitch filters, trim and the buffer limit, on both `capture` and `decode`.
 
 ## Phase 4: Channel identification
 
@@ -39,7 +35,10 @@ no replugging. Needs phase 2.
 - SPI: the clock has regular bursts in multiples of 8 cycles, CS frames them, and data
   changes in step with the clock.
 - UART: idles high, and pulse widths are multiples of one bit time, which gives the baud
-  rate.
+  rate. Logic 2 flags nothing at a wrong rate, so work this out afterwards from one fast
+  digital capture, using a histogram of widths so a glitch cannot pose as a bit. Then
+  confirm by running decoders at candidate rates over that same capture. No device
+  reset or second capture is needed.
 - PWM and clocks: already detected as periodic.
 - Confirm candidates by running decoders over the same capture and keeping the wiring
   that decodes cleanly.

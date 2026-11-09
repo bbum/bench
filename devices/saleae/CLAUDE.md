@@ -3,9 +3,9 @@
 `sal` drives Saleae logic analyzers through Logic 2's gRPC automation server. It is
 a CLI today and will grow an MCP server. First target is the Logic Pro 8.
 
-Status: `sal status`, `sal capture` (timed digital capture with a per-channel summary)
-and `sal decode uart|spi|i2c` (decoded rows with paging and issue counts) work. MCP is
-not built yet. See PLAN.md for the phases.
+Status: `sal status`, `sal capture` (digital capture with a per-channel summary) and
+`sal decode uart|spi|i2c` (decoded rows with paging and issue counts) work, with timed,
+manual and trigger captures and glitch filters. MCP is not built yet. See PLAN.md for the phases.
 
 ## Build
 
@@ -67,6 +67,13 @@ Tested the way SQLite is. New parsing or analysis code ships with all of these:
   ASCII radix, cells hold real newlines. A wrong baud rate gets no error flag at all.
 - UART `mp` and `mdb` modes read one address bit after Bits per Frame, so 9-bit address
   traffic is `--bits 8`.
+- In a trigger capture, time zero is the trigger, and pre-trigger times are negative.
+  Logic 2 ignores `trim_data_seconds` there, so `sal` refuses `--trim` with `--trigger`.
+- A pulse trigger's maximum width of zero is taken literally and never fires.
+- WaitCapture never returns if a trigger never fires, so `sal` applies its own timeout.
+  Never call it on a manual capture.
+- Reaching the buffer limit fails WaitCapture and CloseCapture. `make verify` does this
+  on purpose, so a "Capture Stopped" dialog appearing in Logic 2 is expected.
 - Adding an analyzer takes almost a second, so live tests should not add many.
 - The deployment target is macOS 27.0 because the current toolchain rejects 27.2.
 - Binary exports: this Logic Pro 8 on Logic 2.4.48 produces format V0 (confirmed by

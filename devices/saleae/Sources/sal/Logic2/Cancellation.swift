@@ -40,7 +40,12 @@ final class CaptureCancellation: Sendable {
         if cancelledAlready { task.cancel() }
 
         do {
-            try await task.value
+            // Forwarded because `task` is unstructured, for callers that nest these.
+            try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
         } catch {
             try checkCancelled()
             throw error
@@ -63,22 +68,34 @@ func withCaptureCancellation<Result: Sendable>(
     }
 }
 
-/// Cancels `body` on SIGINT or SIGTERM. The first signal restores the previous handler,
-/// so a second one can still kill the process if cleanup hangs.
+/// Cancels `body` on SIGINT or SIGTERM, or calls `interrupt` instead when given. The
+/// first signal restores the previous handler, so a second one can still kill the
+/// process if cleanup hangs.
 func cancellingOnInterrupt<Result: Sendable>(
+    interrupt: (@Sendable () -> Void)? = nil,
     _ body: @escaping @Sendable () async throws -> Result
 ) async throws -> Result {
-    let work = Task { try await body() }
+    // Held back until the handlers exist, so a signal cannot arrive unnoticed.
+    let (handlersInstalled, finishInstalling) = AsyncStream<Void>.makeStream()
+    let work = Task {
+        for await _ in handlersInstalled {}
+        return try await body()
+    }
     let watches = [SIGINT, SIGTERM].map { number in
         let previous = signal(number, SIG_IGN)
         let source = DispatchSource.makeSignalSource(signal: number, queue: .global())
         source.setEventHandler {
             signal(number, previous)
-            work.cancel()
+            if let interrupt {
+                interrupt()
+            } else {
+                work.cancel()
+            }
         }
         source.resume()
         return (number, previous, source)
     }
+    finishInstalling.finish()
     defer {
         for (number, previous, source) in watches {
             source.cancel()

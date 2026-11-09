@@ -20,6 +20,8 @@ CANCEL = ROOT / "Logic2/Cancellation.swift"
 TABLE = ROOT / "Analysis/DecodedTable.swift"
 DECODERS = ROOT / "Logic2/Decoders.swift"
 DECODE = ROOT / "Subcommands/DecodeCommand.swift"
+MODE = ROOT / "Logic2/CaptureMode.swift"
+OPTIONS = ROOT / "Subcommands/CaptureOptions.swift"
 
 MUTANTS = [
     (CHANNEL, "guard version == 0 else", "guard version >= 0 else"),
@@ -46,7 +48,25 @@ MUTANTS = [
     (SUMMARY, "periodMaxSeconds: periods.max()!", "periodMaxSeconds: periods.min()!"),
     (CAPTURE, "        try? await backend.closeCapture(captureID)\n", ""),
     (CAPTURE, "export.analogDownsampleRatio = 1", "export.analogDownsampleRatio = 2"),
-    (CAPTURE, "device.digitalThresholdVolts = request.levelVolts", "device.digitalThresholdVolts = 1.8"),
+    (MODE, "device.digitalThresholdVolts = levelVolts", "device.digitalThresholdVolts = 1.8"),
+    (MODE, "guard value.isFinite, value > 0 else", "guard value.isFinite else"),
+    (MODE, "trigger.maximumPulse?.value ?? (", "trigger.minimumPulse?.value ?? ("),
+    (MODE, "trigger.point.kind.isPulse ? unboundedPulseSeconds : 0", "unboundedPulseSeconds"),
+    (MODE, "trigger.point.kind.isPulse ? unboundedPulseSeconds : 0", "0"),
+    (MODE, "linked.state = link.isHigh ? .high : .low", "linked.state = .high"),
+    (MODE, "case .high: .pulseHigh", "case .high: .pulseLow"),
+    (MODE, "timed.trimDataSeconds = trimSeconds", "timed.trimDataSeconds = 0"),
+    (MODE, "manual.trimDataSeconds = trimSeconds", "manual.trimDataSeconds = 0"),
+    (MODE, "entry.pulseWidthSeconds = filter.width.value", "entry.pulseWidthSeconds = 0"),
+    (MODE, "bufferSizeMegabytes = bufferMegabytes ?? 0", "bufferSizeMegabytes = 0"),
+    (CAPTURE, "            try await backend.stopCapture(captureID)\n        case .trigger", "        case .trigger"),
+    (CAPTURE, "trigger.timeoutSeconds + trigger.afterSeconds", "trigger.timeoutSeconds"),
+    (CAPTURE, "        try? await backend.stopCapture(captureID)\n        throw CaptureError", "        throw CaptureError"),
+    (OPTIONS, "guard pulseMin.value <= pulseMax.value", "guard pulseMin.value < pulseMax.value"),
+    (OPTIONS, "guard !(manual && trigger != nil) else", "guard true else"),
+    (OPTIONS, "guard trigger == nil || trim == nil else", "guard true else"),
+    (OPTIONS, "let captured = Array(Set(channels + extra)).sorted()", "let captured = channels"),
+    (OPTIONS, "interrupt: manual ? stopManual : nil", "interrupt: nil"),
     (CAPTURE, "    try await backend.closeCapture(captureID)\n}", "    try? await backend.closeCapture(captureID)\n}"),
     (CAPTURE, "    defer { try? FileManager.default.removeItem(at: directory) }\n", ""),
     (CAPTURE, "    try cancellation.checkCancelled()\n    let captureID", "    let captureID"),
@@ -59,12 +79,13 @@ MUTANTS = [
     (CANCEL, "            try checkCancelled()\n            throw error", "            throw error"),
     (CANCEL, "        }\n        try checkCancelled()\n    }", "        }\n    }"),
     (CANCEL, "        cancellation.cancel()\n", ""),
-    (CANCEL, "            signal(number, previous)\n            work.cancel()", "            work.cancel()"),
-    (CANCEL, "            signal(number, previous)\n            work.cancel()", "            signal(number, previous)"),
+    (CANCEL, "            signal(number, previous)\n            if let interrupt", "            if let interrupt"),
+    (CANCEL, "                work.cancel()\n", ""),
+    (CANCEL, "                interrupt()\n", ""),
     (COMMAND, "interruptedExitCode: Int32 = 130", "interruptedExitCode: Int32 = 1"),
     (COMMAND, "maximumChannel: UInt32 = 15", "maximumChannel: UInt32 = 16"),
     (COMMAND, ",\n        rate > 0\n", "\n"),
-    (COMMAND, "guard duration.isFinite, duration > 0", "guard duration > 0"),
+    (OPTIONS, "guard duration.isFinite, duration > 0", "guard duration > 0"),
     (COMMAND, "Set(channels).count == channels.count", "true"),
     (COMMAND, "case 1...: String", "case 2...: String"),
     (TABLE, "guard record.isEmpty, field.isEmpty, !afterQuote else", "guard true else"),

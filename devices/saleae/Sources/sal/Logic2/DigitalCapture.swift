@@ -3,11 +3,14 @@ import Foundation
 struct DigitalCaptureRequest: Sendable {
     var channels: [UInt32]
     var sampleRate: UInt32
-    var durationSeconds: Double
+    var mode: CaptureMode
     /// Logic level. The Logic Pro accepts 1.2, 1.8 or 3.3.
     var levelVolts: Double
     /// Device serial number. When nil, Logic 2 uses the first physical device.
     var deviceID: String?
+    var glitchFilters: [GlitchFilter] = []
+    /// Logic 2's memory limit for the capture. When nil, its own default applies.
+    var bufferMegabytes: UInt32?
 
     var logicChannels: Saleae_Automation_LogicChannels {
         var logicChannels = Saleae_Automation_LogicChannels()
@@ -122,14 +125,14 @@ private func inTemporaryDirectory<Result>(_ body: (URL) async throws -> Result) 
     return try await body(directory)
 }
 
-/// Runs a timed capture and writes binary exports to `directory`.
+/// Runs a capture and writes binary exports to `directory`.
 func exportDigitalCapture(
     _ request: DigitalCaptureRequest,
     to directory: URL,
     using backend: some CaptureBackend,
     cancellation: CaptureCancellation
 ) async throws {
-    try await runTimedCapture(request, using: backend, cancellation: cancellation) { captureID in
+    try await runCapture(request, using: backend, cancellation: cancellation) { captureID in
         var export = Saleae_Automation_ExportRawDataBinaryRequest()
         export.captureID = captureID
         export.directory = directory.path
@@ -140,14 +143,14 @@ func exportDigitalCapture(
     }
 }
 
-/// Runs a timed capture, decodes it, and writes the analyzer's data table to `file`.
+/// Runs a capture, decodes it, and writes the analyzer's data table to `file`.
 func exportDecodedCapture(
     _ request: DecodeRequest,
     to file: URL,
     using backend: some CaptureBackend,
     cancellation: CaptureCancellation
 ) async throws {
-    try await runTimedCapture(request.capture, using: backend, cancellation: cancellation) { captureID in
+    try await runCapture(request.capture, using: backend, cancellation: cancellation) { captureID in
         var add = Saleae_Automation_AddAnalyzerRequest()
         add.captureID = captureID
         add.analyzerName = request.decoder.analyzerName
@@ -167,35 +170,30 @@ func exportDecodedCapture(
     }
 }
 
-/// Runs a timed capture and hands it to `process`. Once a capture has
+/// Runs a capture in its mode and hands it to `process`. Once a capture has
 /// started it is closed on every path, because Logic 2 holds it in memory until then.
 ///
 /// Cancellation interrupts only the wait. Start and export run to completion, so a
 /// started capture is never lost and Logic 2 is never left writing into a removed directory.
-func runTimedCapture(
+func runCapture(
     _ request: DigitalCaptureRequest,
     using backend: some CaptureBackend,
     cancellation: CaptureCancellation,
     process: (UInt64) async throws -> Void
 ) async throws {
-    var device = Saleae_Automation_LogicDeviceConfiguration()
-    device.logicChannels = request.logicChannels
-    device.digitalSampleRate = request.sampleRate
-    device.digitalThresholdVolts = request.levelVolts
-
-    var timed = Saleae_Automation_TimedCaptureMode()
-    timed.durationSeconds = request.durationSeconds
-
-    var start = Saleae_Automation_StartCaptureRequest()
-    start.deviceID = request.deviceID ?? ""
-    start.logicDeviceConfiguration = device
-    start.captureConfiguration.timedCaptureMode = timed
-
     try cancellation.checkCancelled()
-    let captureID = try await backend.startCapture(start)
+    let captureID = try await backend.startCapture(request.startRequest)
 
     do {
-        try await cancellation.interruptible { try await backend.waitCapture(captureID) }
+        switch request.mode {
+        case .timed:
+            try await cancellation.interruptible { try await backend.waitCapture(captureID) }
+        case .manual(let limitSeconds, _, let stop):
+            try await holdManualCapture(limitSeconds: limitSeconds, stop: stop, cancellation: cancellation)
+            try await backend.stopCapture(captureID)
+        case .trigger(let trigger):
+            try await waitForTrigger(trigger, captureID: captureID, using: backend, cancellation: cancellation)
+        }
         try await process(captureID)
         try cancellation.checkCancelled()
     } catch {
@@ -206,3 +204,41 @@ func runTimedCapture(
     }
     try await backend.closeCapture(captureID)
 }
+
+/// Returns once `stop` is cancelled or the limit passes. Throws only if cancelled.
+private func holdManualCapture(
+    limitSeconds: Double?,
+    stop: CaptureCancellation,
+    cancellation: CaptureCancellation
+) async throws {
+    let oneYear = 31_536_000.0
+    try await cancellation.interruptible {
+        // Reaching the limit and being stopped both end the capture normally.
+        try? await stop.interruptible { try await Task.sleep(for: .seconds(limitSeconds ?? oneYear)) }
+    }
+}
+
+/// WaitCapture blocks until the trigger fires, which may be never.
+private func waitForTrigger(
+    _ trigger: DigitalTrigger,
+    captureID: UInt64,
+    using backend: some CaptureBackend,
+    cancellation: CaptureCancellation
+) async throws {
+    let deadline = CaptureCancellation()
+    let watchdog = Task {
+        try await Task.sleep(for: .seconds(trigger.timeoutSeconds + trigger.afterSeconds))
+        deadline.cancel()
+    }
+    defer { watchdog.cancel() }
+
+    do {
+        try await cancellation.interruptible {
+            try await deadline.interruptible { try await backend.waitCapture(captureID) }
+        }
+    } catch where deadline.isCancelled && !cancellation.isCancelled {
+        try? await backend.stopCapture(captureID)
+        throw CaptureError.triggerTimeout(seconds: trigger.timeoutSeconds)
+    }
+}
+

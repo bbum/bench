@@ -12,7 +12,7 @@ struct LiveTests {
     @Test("A live capture of testgen matches the known answers")
     func liveCapture() async throws {
         let request = DigitalCaptureRequest(
-            channels: Array(0...7), sampleRate: 50_000_000, durationSeconds: 0.5, levelVolts: 3.3,
+            channels: Array(0...7), sampleRate: 50_000_000, mode: .timed(seconds: 0.5), levelVolts: 3.3,
             deviceID: nil)
         try Testgen.verify(try await runDigitalCapture(request, endpoint: Logic2Endpoint()))
     }
@@ -20,7 +20,7 @@ struct LiveTests {
     @Test("Cancelling a long live capture ends it promptly and the next capture is clean")
     func cancelledCapture() async throws {
         let long = DigitalCaptureRequest(
-            channels: Array(0...7), sampleRate: 50_000_000, durationSeconds: 60, levelVolts: 3.3,
+            channels: Array(0...7), sampleRate: 50_000_000, mode: .timed(seconds: 60), levelVolts: 3.3,
             deviceID: nil)
         let task = Task { try await runDigitalCapture(long, endpoint: Logic2Endpoint()) }
         try await Task.sleep(for: .seconds(2))
@@ -32,7 +32,7 @@ struct LiveTests {
         #expect(clock.now - cancelled < .seconds(15))
 
         let next = DigitalCaptureRequest(
-            channels: Array(0...7), sampleRate: 50_000_000, durationSeconds: 0.5, levelVolts: 3.3,
+            channels: Array(0...7), sampleRate: 50_000_000, mode: .timed(seconds: 0.5), levelVolts: 3.3,
             deviceID: nil)
         try Testgen.verify(try await runDigitalCapture(next, endpoint: Logic2Endpoint()))
     }
@@ -52,7 +52,7 @@ struct LiveTests {
     @Test("Logic 2 rejects an invalid sample rate and the error reaches the caller")
     func serverRejection() async {
         let request = DigitalCaptureRequest(
-            channels: [0], sampleRate: 123, durationSeconds: 0.05, levelVolts: 3.3, deviceID: nil)
+            channels: [0], sampleRate: 123, mode: .timed(seconds: 0.05), levelVolts: 3.3, deviceID: nil)
         await #expect(throws: (any Error).self) {
             try await runDigitalCapture(request, endpoint: Logic2Endpoint())
         }

@@ -7,42 +7,17 @@ struct CaptureCommand: AsyncParsableCommand {
         abstract: "Run a timed digital capture and summarize each channel."
     )
 
-    @OptionGroup var logic2: Logic2Options
+    @OptionGroup var capture: CaptureOptions
 
     @Option(help: "Digital channels, such as 0-7 or 0,2,4.")
     var channels = "0-7"
 
-    @Option(help: "Digital sample rate, such as 50M or 500000.")
-    var rate = "50M"
-
-    @Option(help: "Capture length in seconds.")
-    var duration = 0.5
-
-    @Option(help: "Logic level in volts: 1.2, 1.8 or 3.3.")
-    var level = 3.3
-
-    @Option(help: "Device serial number. Defaults to the first physical device.")
-    var device: String?
-
     @Flag(help: "Print JSON instead of a table.")
     var json = false
 
-    func validate() throws {
-        guard duration.isFinite, duration > 0 else {
-            throw ValidationError("Duration must be a positive number of seconds.")
-        }
-    }
-
     func run() async throws {
-        let request = DigitalCaptureRequest(
-            channels: try parseChannelList(channels),
-            sampleRate: try parseSampleRate(rate),
-            durationSeconds: duration,
-            levelVolts: level,
-            deviceID: device
-        )
-        let endpoint = logic2.endpoint
-        let summary = try await exitingOnInterrupt {
+        let endpoint = capture.logic2.endpoint
+        let summary = try await capture.perform(channels: try parseChannelList(channels)) { request in
             try await runDigitalCapture(request, endpoint: endpoint)
         }
 
@@ -62,10 +37,11 @@ let interruptedExitCode: Int32 = 130
 
 /// Runs `body`, turning an interrupt into a message and the conventional exit code.
 func exitingOnInterrupt<Result: Sendable>(
+    interrupt: (@Sendable () -> Void)? = nil,
     _ body: @escaping @Sendable () async throws -> Result
 ) async throws -> Result {
     do {
-        return try await cancellingOnInterrupt(body)
+        return try await cancellingOnInterrupt(interrupt: interrupt, body)
     } catch is CancellationError {
         FileHandle.standardError.write(Data("Capture cancelled\n".utf8))
         throw ExitCode(interruptedExitCode)
