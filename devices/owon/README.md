@@ -1,47 +1,42 @@
 # ow
 
-CLI and MCP stdio server for Owon SDS-series oscilloscopes. Capture screenshots
-and waveforms over LAN; expose the same operations to LLMs so an agent can
-debug hardware directly.
+Captures screenshots and waveforms from an Owon SDS-series oscilloscope over LAN, from the
+command line or as an MCP server, so an agent can look at real signals while debugging.
 
-Verified against an SDS7102V; should work for the rest of the SDS series.
+Verified on an SDS7102V. The rest of the SDS series is likely to work, but is untested.
 
 ## Install
 
-```
-make install     # → ~/.local/bin/ow
-```
+Needs macOS 26 or later and Swift 6.2 or later. It uses only Apple's frameworks, plus
+Swift Argument Parser.
 
-Requires Swift 6.2+, macOS 26+.
+```
+make install     # builds and copies to ~/.local/bin/ow
+```
 
 ## Usage
 
+Tell it where the scope is, once:
+
 ```
 ow config set host 10.0.1.230
-ow status                     # identify the scope, print current waveform info
-ow screen out.png             # capture display (BMP→PNG conversion if .png)
-ow data out.bin               # capture waveform via STARTBIN
-ow memdepth out.bin           # capture deep-memory waveform via STARTMEMDEPTH
-ow bin --csv out.bin          # parse + summarize, write out.csv next to it
-ow mcp                        # run as MCP stdio server
 ```
 
-Run `ow --help` or `ow <subcommand> --help` for details.
+Then:
+
+```
+ow status                     # identify the scope and summarize the current waveform
+ow screen out.png             # capture the display, as PNG or BMP from the extension
+ow data out.bin               # capture a waveform
+ow memdepth out.bin           # capture a deep-memory waveform
+ow bin --csv out.bin          # parse a saved capture and write out.csv beside it
+```
+
+Commands that talk to the scope take `--host` and `--port` for one-off use. `ow <command> --help` has the
+details. Human-readable progress goes to stderr and parseable output to stdout. Set
+`OW_DEBUG=1` for connection traces.
 
 ## MCP
-
-```
-ow mcp
-```
-
-Speaks JSON-RPC over stdio. Four tools:
-
-- `scope_status` — probe + identify
-- `capture_screenshot` — returns PNG inline (so an LLM can view it)
-- `capture_waveform` — capture + parse, with `deep_memory`, `include_samples`, `decimate` options
-- `parse_bin_file` — parse a saved `.bin` from disk
-
-Drop the binary in your MCP client config — e.g. for Claude Desktop:
 
 ```json
 {
@@ -51,13 +46,34 @@ Drop the binary in your MCP client config — e.g. for Claude Desktop:
 }
 ```
 
-## Protocol
+| Tool | What it does |
+|------|--------------|
+| `scope_status` | Probe and identify the scope. `quick=true` only checks TCP. |
+| `capture_screenshot` | Capture the display and return a PNG inline, so a model can see it. |
+| `capture_waveform` | Capture and parse. Returns summary statistics by default. `include_samples`, `decimate` and `deep_memory` ask for more. |
+| `parse_bin_file` | Parse a saved `.bin` file. Same output as `capture_waveform`. |
 
-The Owon SDS network protocol is reverse-engineered — the vendor manual does
-not document it. See [`PROTOCOL.md`](PROTOCOL.md) for the byte-level reference.
-The scope does **not** speak SCPI; there is no remote-control surface, only
-capture-and-analyze.
+`ow mcp scope_status capture_screenshot` enables only the tools you name.
 
-## License
+## Things to know
 
-MIT (see [LICENSE](../../LICENSE)).
+- **Capture only.** The scope does not speak SCPI. There is no way to change its settings
+  remotely, only to capture what it is showing.
+- **One connection at a time.** Concurrent connections can lock the scope up until it is power
+  cycled. `ow` runs requests one after another, but don't run two copies against one scope.
+- **The protocol is reverse-engineered.** The vendor documents none of it. See
+  [`PROTOCOL.md`](PROTOCOL.md) for the byte-level reference. Three commands are known:
+  `STARTBMP`, `STARTBIN` and `STARTMEMDEPTH`, on TCP port 3000.
+- **It connects through `/usr/bin/nc`.** That looks odd but is deliberate. On a Mac with two
+  interfaces on the same subnet, the scope's network stack answers ARP on only one path, and
+  third-party binaries are then refused a route that Apple's entitled tools can use. Launching
+  `nc` costs about 5 ms against captures that take hundreds of milliseconds.
+
+## Development
+
+```
+swift build
+swift test       # parser tests against saved captures in test-data/
+```
+
+MIT, see [LICENSE](../../LICENSE).
