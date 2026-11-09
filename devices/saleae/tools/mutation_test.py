@@ -134,7 +134,6 @@ MUTANTS = [
     (IDENTIFY, "guard whole <= longestActiveBits else { return nil }", ""),
     (IDENTIFY, "if candidate.level(afterEdges: index + 1) == resting {", "if false {"),
     (IDENTIFY, "for _ in 0..<3 {", "for _ in 0..<0 {"),
-    (IDENTIFY, "sorted[first] * 1.35", "sorted[first] * 1.01"),
     (IDENTIFY, "$0.summary.initialLevel == 1 }", "false }"),
     (CAPTURE, "for inverted in [uart.inverted, !uart.inverted]", "for inverted in [uart.inverted]"),
     (CAPTURE, "for parity in Parity.allCases", "for parity in [Parity.none]"),

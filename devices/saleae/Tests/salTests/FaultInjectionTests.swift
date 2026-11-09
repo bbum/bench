@@ -429,6 +429,18 @@ struct CancellationTests {
         #expect(result == false)
     }
 
+    @Test("Ctrl-C ends a manual capture and keeps its data instead of cancelling it")
+    func manualInterrupt() async throws {
+        let command = try #require(try Sal.parseAsRoot(["capture", "--manual"]) as? CaptureCommand)
+        let result = try await command.capture.perform(channels: [0]) { request -> String in
+            guard case .manual(_, _, let stop) = request.mode else { return "not manual" }
+            kill(getpid(), SIGINT)
+            while !stop.isCancelled { try await Task.sleep(for: .milliseconds(1)) }
+            return "stopped"
+        }
+        #expect(result == "stopped")
+    }
+
     @Test("Interrupted captures use the shell's SIGINT exit code")
     func exitCode() {
         #expect(interruptedExitCode == 130)

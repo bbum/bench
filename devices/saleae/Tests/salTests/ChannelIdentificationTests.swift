@@ -158,6 +158,18 @@ struct RecordedIdentificationTests {
         #expect(result.unknown.isEmpty)
     }
 
+    @Test("Recorded bit-banged UART near 921600 baud, with heavy edge jitter, is found")
+    func recordedFastUART() throws {
+        let directory = fixtureDirectory.deletingLastPathComponent().appendingPathComponent("fast")
+        let result = identifyChannels(try loadChannels(directory: directory, channels: [2]))
+        guard case .uart(let uart)? = result.buses.first?.decoder else {
+            Issue.record("not identified as UART: \(result)")
+            return
+        }
+        #expect(abs(Double(uart.baud) - 921_600) <= 921_600 * 0.07)
+        #expect(!uart.inverted)
+    }
+
     @Test("All 40,320 ways of wiring the 8 channels are identified")
     func everyWiring() throws {
         // Five cycles of traffic: enough to judge, and quick enough for every wiring.
@@ -312,6 +324,20 @@ struct IdentificationRuleTests {
         #expect(try uart(result).baud == 921_600)
     }
 
+    @Test("A minority of short pulses does not set the bit time")
+    func shortMinority() throws {
+        let bit = 1 / 115_200.0
+        var times = uartTimes(text + text + text, bit: bit)
+        // Pulls every tenth single-bit low pulse in by over a fifth of a bit.
+        var pulses = 0
+        for index in stride(from: 1, to: times.count, by: 2) where abs(times[index] - times[index - 1] - bit) < bit / 10 {
+            pulses += 1
+            if pulses.isMultiple(of: 10) { times[index] -= bit * 0.22 }
+        }
+        #expect(pulses >= 30)
+        #expect(try uart(identifyChannels([try channel(2, initial: 1, times)])).baud == 115_200)
+    }
+
     @Test("Pauses between frames can be any length", arguments: [0.37, 1.5, 3.21, 50.8])
     func framePauses(pauseBits: Double) throws {
         let bit = 1 / 115_200.0
@@ -447,7 +473,17 @@ struct IdentificationRuleTests {
     func i2cThin() throws {
         let waves = i2cWaves(transactions: 1)
         let result = identifyChannels([try channel(0, initial: 1, waves.sda), try channel(1, initial: 1, waves.scl)])
+        #expect(result.buses.first?.decoder == .i2c(I2CDecoder(sda: 0, scl: 1)))
         #expect(result.buses.first?.confidence == .uncertain)
+    }
+
+    @Test("One transaction of mostly zeros is still I2C, though SDA rests low within it")
+    func i2cMostlyZeros() throws {
+        let waves = i2cWaves(transactions: 1, bytes: [0x55, 0x00, 0x00, 0x00])
+        let sda = try channel(0, initial: 1, waves.sda)
+        #expect(sda.restingLevel == 0)
+        let result = identifyChannels([sda, try channel(1, initial: 1, waves.scl)])
+        #expect(result.buses.first?.decoder == .i2c(I2CDecoder(sda: 0, scl: 1)))
     }
 
     @Test("Two I2C buses are reported with the ambiguity stated")
