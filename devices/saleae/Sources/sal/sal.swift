@@ -16,7 +16,7 @@ struct Sal: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "sal",
         abstract: "Drive Saleae logic analyzers through Logic 2's automation server.",
-        subcommands: [Status.self, CaptureCommand.self]
+        subcommands: [Status.self, CaptureCommand.self, DecodeCommand.self]
     )
 }
 

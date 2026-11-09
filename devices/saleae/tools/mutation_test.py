@@ -17,6 +17,9 @@ CAPTURE = ROOT / "Logic2/DigitalCapture.swift"
 COMMAND = ROOT / "Subcommands/CaptureCommand.swift"
 MAIN = ROOT / "sal.swift"
 CANCEL = ROOT / "Logic2/Cancellation.swift"
+TABLE = ROOT / "Analysis/DecodedTable.swift"
+DECODERS = ROOT / "Logic2/Decoders.swift"
+DECODE = ROOT / "Subcommands/DecodeCommand.swift"
 
 MUTANTS = [
     (CHANNEL, "guard version == 0 else", "guard version >= 0 else"),
@@ -64,6 +67,25 @@ MUTANTS = [
     (COMMAND, "guard duration.isFinite, duration > 0", "guard duration > 0"),
     (COMMAND, "Set(channels).count == channels.count", "true"),
     (COMMAND, "case 1...: String", "case 2...: String"),
+    (TABLE, "guard record.isEmpty, field.isEmpty, !afterQuote else", "guard true else"),
+    (TABLE, "guard !inQuotes else", "guard true else"),
+    (TABLE, "guard field.isEmpty, !afterQuote else", "guard !afterQuote else"),
+    (TABLE, "guard record.count == header.count else", "guard record.count >= header.count else"),
+    (TABLE, "Set(header).count == header.count", "true"),
+    (TABLE, "start.isFinite,", "true,"),
+    (TABLE, "duration.isFinite, duration >= 0", "duration >= 0"),
+    (TABLE, "duration.isFinite, duration >= 0", "duration.isFinite"),
+    (TABLE, " where !record[column].isEmpty", ""),
+    (TABLE, 'row.type == "address" || !reading', "!reading"),
+    (TABLE, 'reading = read == "true"', "reading = false"),
+    (TABLE, "rows.dropFirst(offset).prefix(limit)", "rows.prefix(limit)"),
+    (DECODERS, 'case 1: "1 Bit per Transfer"', 'case 1: "1 Bits per Transfer"'),
+    (DECODERS, "wordBits: ClosedRange<Int> = 1...64", "wordBits: ClosedRange<Int> = 1...65"),
+    (DECODERS, "[i2c.sda, i2c.scl].sorted()", "[i2c.sda, i2c.scl]"),
+    (CAPTURE, "analyzer.radixType = request.radix.type", "analyzer.radixType = .hexadecimal"),
+    (DECODE, "guard baud > 0", "guard baud >= 0"),
+    (DECODE, "guard limit > 0", "guard limit >= 0"),
+    (DECODE, "guard offset >= 0", "guard offset > 0"),
     (MAIN, "guard !devices.isEmpty else", "guard devices.isEmpty else"),
 ]
 

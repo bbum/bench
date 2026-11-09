@@ -3,15 +3,16 @@
 `sal` drives Saleae logic analyzers through Logic 2's gRPC automation server. It is
 a CLI today and will grow an MCP server. First target is the Logic Pro 8.
 
-Status: `sal status` and `sal capture` (timed digital capture with a per-channel
-summary) work. Protocol decoding and MCP are not built yet. See PLAN.md for the phases.
+Status: `sal status`, `sal capture` (timed digital capture with a per-channel summary)
+and `sal decode uart|spi|i2c` (decoded rows with paging and issue counts) work. MCP is
+not built yet. See PLAN.md for the phases.
 
 ## Build
 
 ```
 swift build
 make test        # offline, uses a recorded testgen capture
-make verify      # live end-to-end check; needs Logic 2 and the testgen board
+make verify      # live end-to-end check; needs Logic 2 and testgen on USB
 make build       # release
 make install     # release -> ~/.local/bin/sal
 make proto       # regenerate Sources/sal/Generated; needs protoc
@@ -37,7 +38,7 @@ Tested the way SQLite is. New parsing or analysis code ships with all of these:
 - **Fault injection:** every Logic 2 call fails, alone and in every combination.
   Started captures must close and temp files must go. The same holds when cancelled
   at every step.
-- **Hardware:** `make verify` checks a live capture of `testgen`.
+- **Hardware:** `make verify` checks live captures of every `testgen` format and fault.
 - **Regressions:** every bug found gets a test.
 
 ## Why it is built this way
@@ -62,10 +63,16 @@ Tested the way SQLite is. New parsing or analysis code ships with all of these:
   - `I2C`: `SDA`, `SCL`
 - Cancelling a capture must not cancel its cleanup, or the gRPC connection goes with it.
   `withCaptureCancellation` shields the work, and only the wait is interruptible.
+- Data table columns vary with the data. `error` appears only when a row has one. In
+  ASCII radix, cells hold real newlines. A wrong baud rate gets no error flag at all.
+- UART `mp` and `mdb` modes read one address bit after Bits per Frame, so 9-bit address
+  traffic is `--bits 8`.
+- Adding an analyzer takes almost a second, so live tests should not add many.
 - The deployment target is macOS 27.0 because the current toolchain rejects 27.2.
 - Binary exports: this Logic Pro 8 on Logic 2.4.48 produces format V0 (confirmed by
   capture). Saleae says the device will move to a chunked V1, so check the version
   field and reject anything unknown.
-- `testgen/` is an ESP8266 known-answer signal source. Its README has the wiring and
-  the expected values for each channel.
+- `testgen/` is an ESP8266 known-answer signal source. Its README has the wiring, the
+  expected values for each channel, and the modes selected over USB serial. Opening
+  the port resets the board, but closing it does not, so tests restore clean mode.
 - `proto/` is a verbatim copy of upstream. See `proto/UPSTREAM`.

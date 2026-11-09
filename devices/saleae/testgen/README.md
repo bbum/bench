@@ -21,3 +21,23 @@ make flash
 
 Each cycle sends sync, UART, SPI, then I2C, followed by a 20 ms gap. The firmware
 drives the I2C ACK bits itself because the bus has no receiver.
+
+## Modes
+
+Sending one character over USB serial at 115200 selects a mode, and the board replies
+`mode <key>`. Opening the port resets the board to `c`. Closing it does not, so send
+`c` when done. Modes other than `c` bit-bang UART and SPI, send the same bytes as above,
+and stop the PWM.
+
+| Key | UART                                 | SPI                     | I2C                        |
+|-----|--------------------------------------|-------------------------|----------------------------|
+| `c` | 8N1, hardware                        | Mode 0, hardware        | Clean                      |
+| `a` | 7 data bits, 2 stop bits             | Mode 1                  | Clean                      |
+| `b` | 8E1                                  | Mode 2                  | Clean                      |
+| `d` | 8O1                                  | Mode 3                  | Clean                      |
+| `e` | 8N, 1.5 stop bits                    | LSB first               | Clean                      |
+| `g` | 8N1, MSB first                       | 16-bit words            | Clean                      |
+| `h` | 8N1, inverted                        | Enable active high      | Clean                      |
+| `i` | 9 data bits, ninth set on first only | Mode 0                  | Clean                      |
+| `f` | 8N1: `41`, `42` with a bad stop, `43`| Mode 0                  | `AD` NACKed, then `0x43` unanswered |
+| `p` | 8E1: `44`, `45` with wrong parity    | Mode 0                  | Clean                      |

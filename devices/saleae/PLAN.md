@@ -13,19 +13,15 @@ runs on demand rather than every phase.
 ## Done
 
 Foundation: gRPC client, `sal status`, `sal capture` with per-channel summaries, binary
-export parser, the `testgen` board, and the test layers. Uses 7 of the 16 RPCs.
+export parser, the `testgen` board, and the test layers. Uses 9 of the 16 RPCs.
 
 Phase 1, cancellation: Ctrl-C, SIGTERM or task cancellation stops and closes the capture
 and removes temp files.
 
-## Phase 2: Decoders
-
-Run UART, SPI and I2C decoders and return decoded rows inline with paging. Cover every
-analyzer setting, not just the defaults.
-
-- Add a `testgen` fault mode with NACKs, framing errors and wrong baud rates, so tests
-  prove faults are detected as well as clean traffic decoded.
-- Proof: `make verify` compares actual bytes against what `testgen` sent.
+Phase 2, decoders: `sal decode uart|spi|i2c` with every analyzer setting, paged rows, and
+issue counts. `testgen` selects each format and fault over USB serial. Logic 2 flags
+framing and parity errors but reports nothing for a wrong baud rate, so phase 4 has to
+work that out from timing.
 
 ## Phase 3: Capture modes
 

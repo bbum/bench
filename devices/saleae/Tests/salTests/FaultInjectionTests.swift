@@ -3,7 +3,7 @@ import Synchronization
 import Testing
 @testable import sal
 
-private enum Step: CaseIterable, Sendable { case start, stop, wait, export, close }
+private enum Step: CaseIterable, Sendable { case start, stop, wait, export, analyzer, table, close }
 private struct InjectedFault: Error, Equatable {}
 
 private actor FakeBackend: CaptureBackend {
@@ -16,6 +16,9 @@ private actor FakeBackend: CaptureBackend {
     private(set) var closeSawCancellation = false
     private(set) var startRequest: Saleae_Automation_StartCaptureRequest?
     private(set) var exportRequest: Saleae_Automation_ExportRawDataBinaryRequest?
+    private(set) var analyzerRequest: Saleae_Automation_AddAnalyzerRequest?
+    private(set) var tableRequest: Saleae_Automation_ExportDataTableCsvRequest?
+    var tableBytes = Data("name,type,start_time,duration,\"data\"\n\"a\",\"data\",1,0.5,0x41\n".utf8)
 
     init(
         failing: Set<Step> = [],
@@ -54,6 +57,22 @@ private actor FakeBackend: CaptureBackend {
         exportRequest = request
         try await record(.export)
         try writeExport(URL(fileURLWithPath: request.directory))
+    }
+
+    func addAnalyzer(_ request: Saleae_Automation_AddAnalyzerRequest) async throws -> UInt64 {
+        analyzerRequest = request
+        try await record(.analyzer)
+        return 7
+    }
+
+    func exportDataTable(_ request: Saleae_Automation_ExportDataTableCsvRequest) async throws {
+        tableRequest = request
+        try await record(.table)
+        try tableBytes.write(to: URL(fileURLWithPath: request.filepath))
+    }
+
+    func setTable(_ bytes: Data) {
+        tableBytes = bytes
     }
 
     func closeCapture(_ captureID: UInt64) async throws {
@@ -362,3 +381,78 @@ struct CancellationTests {
         #expect(interruptedExitCode == 130)
     }
 }
+
+private let decodeRequest = DecodeRequest(
+    capture: DigitalCaptureRequest(
+        channels: [2], sampleRate: 50_000_000, durationSeconds: 0.5, levelVolts: 3.3, deviceID: nil),
+    decoder: .uart(UARTDecoder(channel: 2, baud: 115_200)),
+    radix: .dec)
+
+@Suite("Decode fault injection")
+struct DecodeFaultInjectionTests {
+    private func decode(
+        _ backend: FakeBackend,
+        cancellation: CaptureCancellation = CaptureCancellation()
+    ) async throws -> [DecodedRow] {
+        try await decodedCapture { file in
+            try await exportDecodedCapture(
+                decodeRequest, to: file, using: backend, cancellation: cancellation)
+        }
+    }
+
+    @Test("A clean decode adds the analyzer, exports it, closes, and reads the rows")
+    func cleanRun() async throws {
+        let backend = FakeBackend()
+        let rows = try await decode(backend)
+        #expect(rows == [DecodedRow(type: "data", start: 1, duration: 0.5, fields: ["data": "0x41"])])
+        #expect(await backend.calls == [.start, .wait, .analyzer, .table, .close])
+        #expect(await backend.closedIDs == [42])
+    }
+
+    @Test("The analyzer and table requests carry every setting")
+    func requests() async throws {
+        let backend = FakeBackend()
+        _ = try await decode(backend)
+        let add = try #require(await backend.analyzerRequest)
+        #expect(add.captureID == 42)
+        #expect(add.analyzerName == "Async Serial")
+        #expect(add.settings == decodeRequest.decoder.settings)
+        let table = try #require(await backend.tableRequest)
+        #expect(table.captureID == 42)
+        #expect(table.analyzers.map(\.analyzerID) == [7])
+        #expect(table.analyzers.map(\.radixType) == [.decimal])
+        #expect(await backend.startRequest?.logicDeviceConfiguration.logicChannels.digitalChannels == [2])
+    }
+
+    @Test("Every combination of failing steps closes at most once")
+    func everyCombination() async {
+        let steps = Step.allCases
+        for mask in 0..<(1 << steps.count) {
+            let failing = Set(steps.indices.filter { mask & (1 << $0) != 0 }.map { steps[$0] })
+            let backend = FakeBackend(failing: failing)
+            let rows = try? await decode(backend)
+            let relevant = failing.subtracting([.stop, .export])
+            #expect((rows != nil) == relevant.isEmpty, "failing: \(failing)")
+            #expect(await backend.closedIDs.count == (failing.contains(.start) ? 0 : 1), "failing: \(failing)")
+        }
+    }
+
+    @Test("Cancelling during an analyzer step finishes it, then stops and closes", arguments: [Step.analyzer, .table])
+    private func cancelled(step: Step) async {
+        let cancellation = CaptureCancellation()
+        let backend = FakeBackend(onEnter: { if $0 == step { cancellation.cancel() } })
+        await #expect(throws: CancellationError.self) {
+            try await decode(backend, cancellation: cancellation)
+        }
+        #expect(await backend.calls == [.start, .wait, .analyzer, .table, .stop, .close])
+    }
+
+    @Test("A corrupt data table is reported")
+    func corruptTable() async {
+        let backend = FakeBackend()
+        await backend.setTable(Data("garbage\n".utf8))
+        await #expect(throws: DecodedTableError.invalidHeader) { try await decode(backend) }
+        #expect(await backend.closedIDs == [42])
+    }
+}
+

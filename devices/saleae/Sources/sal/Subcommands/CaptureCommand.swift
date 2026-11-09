@@ -42,14 +42,8 @@ struct CaptureCommand: AsyncParsableCommand {
             deviceID: device
         )
         let endpoint = logic2.endpoint
-        let summary: CaptureSummary
-        do {
-            summary = try await cancellingOnInterrupt {
-                try await runDigitalCapture(request, endpoint: endpoint)
-            }
-        } catch is CancellationError {
-            FileHandle.standardError.write(Data("Capture cancelled\n".utf8))
-            throw ExitCode(interruptedExitCode)
+        let summary = try await exitingOnInterrupt {
+            try await runDigitalCapture(request, endpoint: endpoint)
         }
 
         if json {
@@ -66,8 +60,20 @@ struct CaptureCommand: AsyncParsableCommand {
 /// The shell convention for a process ended by SIGINT.
 let interruptedExitCode: Int32 = 130
 
+/// Runs `body`, turning an interrupt into a message and the conventional exit code.
+func exitingOnInterrupt<Result: Sendable>(
+    _ body: @escaping @Sendable () async throws -> Result
+) async throws -> Result {
+    do {
+        return try await cancellingOnInterrupt(body)
+    } catch is CancellationError {
+        FileHandle.standardError.write(Data("Capture cancelled\n".utf8))
+        throw ExitCode(interruptedExitCode)
+    }
+}
+
 /// Highest channel index on any Saleae device. Bounds ranges before they are expanded.
-private let maximumChannel: UInt32 = 15
+let maximumChannel: UInt32 = 15
 
 func parseChannelList(_ text: String) throws -> [UInt32] {
     var channels: [UInt32] = []
