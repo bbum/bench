@@ -19,6 +19,7 @@ swift build
 make test        # offline, uses a recorded testgen capture; about 40 s
 make verify      # live end-to-end check; needs Logic 2 and testgen on USB
 make build       # release
+make blind       # score sal identify on random signals; ARGS="--runs 40 --seed 3"
 make install     # release -> ~/.local/bin/sal
 sal mcp          # MCP server over stdio
 make proto       # regenerate Sources/sal/Generated; needs protoc

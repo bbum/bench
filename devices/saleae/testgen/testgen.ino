@@ -3,6 +3,7 @@
 
 #include <ESP8266WiFi.h>
 #include <SPI.h>
+#include <core_esp8266_waveform.h>
 
 static const uint8_t PIN_PWM = 12;
 static const uint8_t PIN_SYNC = 16;
@@ -49,6 +50,19 @@ struct Variant {
   UartFormat uart;
   SpiFormat spi;
   Fault fault;
+};
+
+// Declared here because Arduino generates prototypes above later definitions.
+static const uint8_t MAX_SCENARIO_BYTES = 32;
+
+struct ScenarioSignal {
+  char kind;
+  uint8_t pinA, pinB, pinC;
+  uint32_t numberA, numberB, numberC;
+  bool flagA, flagB, flagC;
+  char parity;
+  uint8_t dataLength;
+  uint8_t data[MAX_SCENARIO_BYTES];
 };
 
 static const UartFormat FORMAT_8N1 = {8, 'N', 2, false, false};
@@ -146,11 +160,15 @@ static void sendUART() {
 
 // UART bit edges tolerate only a few microseconds, so this runs from RAM with direct
 // register writes. A flash fetch would be late enough to corrupt a bit.
+static uint8_t uartActivePin = PIN_UART;
+
 static void IRAM_ATTR uartPin(bool high) {
-  if (high) {
-    GPOS = 1 << PIN_UART;
+  if (uartActivePin == 16) {
+    GP16O = high ? 1 : 0;
+  } else if (high) {
+    GPOS = 1 << uartActivePin;
   } else {
-    GPOC = 1 << PIN_UART;
+    GPOC = 1 << uartActivePin;
   }
 }
 
@@ -253,7 +271,308 @@ static void useHardwarePeripherals() {
   activeVariant = nullptr;
 }
 
+// Scenarios put any signal on any pin. A host chooses them and keeps the answer, so
+// analysis of the wires can be scored blind. See tools/blind_test.py.
+static const uint8_t CHANNEL_PINS[8] = {12, 16, 2, 14, 13, 15, 4, 5};
+static const uint8_t MAX_SCENARIO_SIGNALS = 8;
+static ScenarioSignal scenario[MAX_SCENARIO_SIGNALS];
+static uint8_t scenarioCount = 0;
+static uint32_t scenarioGapMs = 20;
+
+static void stopAllWaveforms() {
+  for (uint8_t pin : CHANNEL_PINS) {
+    if (pin != 16) {
+      stopWaveform(pin);
+    }
+  }
+}
+
+static void pinHalfPeriod(uint32_t micros) {
+  delayMicroseconds(micros);
+}
+
+static void playUart(const ScenarioSignal &signal) {
+  UartFormat format = {8, signal.parity, static_cast<uint8_t>(signal.numberB), false, signal.flagA};
+  uartActivePin = signal.pinA;
+  uartBitCycles = F_CPU / signal.numberA;
+  for (uint8_t i = 0; i < signal.dataLength; i++) {
+    uartFrame(format, signal.data[i]);
+  }
+  uartActivePin = PIN_UART;
+  uartBitCycles = DEFAULT_UART_BIT_CYCLES;
+}
+
+static void playSpi(const ScenarioSignal &signal) {
+  const bool cpol = signal.flagA, cpha = signal.flagB, csHigh = signal.flagC;
+  const uint32_t half = signal.numberA;
+  digitalWrite(signal.pinA, cpol ? HIGH : LOW);
+  if (signal.pinC != 0xFF) {
+    digitalWrite(signal.pinC, csHigh ? HIGH : LOW);
+    pinHalfPeriod(half);
+  }
+  for (uint8_t i = 0; i < signal.dataLength; i++) {
+    for (int bit = 7; bit >= 0; bit--) {
+      bool level = (signal.data[i] >> bit) & 1;
+      if (!cpha) {
+        digitalWrite(signal.pinB, level ? HIGH : LOW);
+        pinHalfPeriod(half);
+        digitalWrite(signal.pinA, cpol ? LOW : HIGH);
+        pinHalfPeriod(half);
+        digitalWrite(signal.pinA, cpol ? HIGH : LOW);
+      } else {
+        digitalWrite(signal.pinA, cpol ? LOW : HIGH);
+        digitalWrite(signal.pinB, level ? HIGH : LOW);
+        pinHalfPeriod(half);
+        digitalWrite(signal.pinA, cpol ? HIGH : LOW);
+        pinHalfPeriod(half);
+      }
+    }
+  }
+  if (signal.pinC != 0xFF) {
+    pinHalfPeriod(half);
+    digitalWrite(signal.pinC, csHigh ? LOW : HIGH);
+  }
+}
+
+static void i2cBit(const ScenarioSignal &signal, bool level) {
+  digitalWrite(signal.pinA, level ? HIGH : LOW);
+  pinHalfPeriod(signal.numberA);
+  digitalWrite(signal.pinB, HIGH);
+  pinHalfPeriod(signal.numberA);
+  digitalWrite(signal.pinB, LOW);
+}
+
+static void i2cOutByte(const ScenarioSignal &signal, uint8_t value) {
+  for (int bit = 7; bit >= 0; bit--) {
+    i2cBit(signal, (value >> bit) & 1);
+  }
+  i2cBit(signal, false);
+}
+
+static void playI2c(const ScenarioSignal &signal) {
+  digitalWrite(signal.pinA, LOW);
+  pinHalfPeriod(signal.numberA);
+  digitalWrite(signal.pinB, LOW);
+  pinHalfPeriod(signal.numberA);
+  i2cOutByte(signal, static_cast<uint8_t>(signal.numberB) << 1);
+  for (uint8_t i = 0; i < signal.dataLength; i++) {
+    i2cOutByte(signal, signal.data[i]);
+  }
+  digitalWrite(signal.pinA, LOW);
+  pinHalfPeriod(signal.numberA);
+  digitalWrite(signal.pinB, HIGH);
+  pinHalfPeriod(signal.numberA);
+  digitalWrite(signal.pinA, HIGH);
+  pinHalfPeriod(signal.numberA);
+}
+
+static void playPulse(const ScenarioSignal &signal) {
+  digitalWrite(signal.pinA, signal.flagA ? LOW : HIGH);
+  delayMicroseconds(signal.numberA);
+  digitalWrite(signal.pinA, signal.flagA ? HIGH : LOW);
+}
+
+static void playNoise(const ScenarioSignal &signal) {
+  bool level = signal.flagA;
+  for (uint32_t i = 0; i < signal.numberA; i++) {
+    level = !level;
+    digitalWrite(signal.pinA, level ? HIGH : LOW);
+    delayMicroseconds(1 + ESP.random() % signal.numberB);
+  }
+  digitalWrite(signal.pinA, signal.flagA ? HIGH : LOW);
+}
+
+static void playClockBurst(const ScenarioSignal &signal) {
+  for (uint32_t i = 0; i < signal.numberA; i++) {
+    digitalWrite(signal.pinA, HIGH);
+    pinHalfPeriod(signal.numberB);
+    digitalWrite(signal.pinA, LOW);
+    pinHalfPeriod(signal.numberB);
+  }
+}
+
+static void playScenario() {
+  for (uint8_t i = 0; i < scenarioCount; i++) {
+    const ScenarioSignal &signal = scenario[i];
+    switch (signal.kind) {
+      case 'u': playUart(signal); break;
+      case 's': playSpi(signal); break;
+      case 'i': playI2c(signal); break;
+      case 'p': playPulse(signal); break;
+      case 'n': playNoise(signal); break;
+      case 'b': playClockBurst(signal); break;
+      default: break;
+    }
+    delayMicroseconds(100);
+    yield();
+  }
+  delay(scenarioGapMs);
+}
+
+static uint8_t hexNibble(char c) {
+  return c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10;
+}
+
+static uint8_t parseHex(const char *text, uint8_t *out) {
+  uint8_t count = 0;
+  while (text[0] && text[1] && count < MAX_SCENARIO_BYTES) {
+    out[count++] = (hexNibble(text[0]) << 4) | hexNibble(text[1]);
+    text += 2;
+  }
+  return count;
+}
+
+static uint8_t channelPin(const char *text) {
+  int channel = atoi(text);
+  return channel >= 0 && channel < 8 ? CHANNEL_PINS[channel] : 0xFF;
+}
+
+// Fields are comma separated, positional, and described with each kind below.
+static bool parseScenarioSignal(char *text, ScenarioSignal &signal) {
+  char *fields[10];
+  uint8_t count = 0;
+  char *saved = nullptr;
+  for (char *field = strtok_r(text, ",", &saved); field && count < 10; field = strtok_r(nullptr, ",", &saved)) {
+    fields[count++] = field;
+  }
+  if (count < 2) {
+    return false;
+  }
+  memset(&signal, 0, sizeof(signal));
+  signal.kind = fields[0][0];
+  signal.pinA = channelPin(fields[1]);
+  switch (signal.kind) {
+    case 'u':  // u,CH,BAUD,PARITY,STOPHALVES,INVERTED,HEX
+      if (count != 7) return false;
+      signal.numberA = atol(fields[2]);
+      signal.parity = fields[3][0];
+      signal.numberB = atol(fields[4]);
+      signal.flagA = fields[5][0] == '1';
+      signal.dataLength = parseHex(fields[6], signal.data);
+      return signal.numberA > 0;
+    case 's':  // s,CLK,MOSI,CS or -1,CPOL,CPHA,HALFUS,CSHIGH,HEX
+      if (count != 9) return false;
+      signal.pinB = channelPin(fields[2]);
+      signal.pinC = channelPin(fields[3]);
+      signal.flagA = fields[4][0] == '1';
+      signal.flagB = fields[5][0] == '1';
+      signal.numberA = atol(fields[6]);
+      signal.flagC = fields[7][0] == '1';
+      signal.dataLength = parseHex(fields[8], signal.data);
+      return true;
+    case 'i':  // i,SDA,SCL,HALFUS,ADDRESS,HEX
+      if (count != 6) return false;
+      signal.pinB = channelPin(fields[2]);
+      signal.numberA = atol(fields[3]);
+      signal.numberB = strtol(fields[4], nullptr, 16);
+      signal.dataLength = parseHex(fields[5], signal.data);
+      return true;
+    case 'w':  // w,CH,HZ,DUTYPERCENT
+      if (count != 4) return false;
+      signal.numberA = atol(fields[2]);
+      signal.numberB = atol(fields[3]);
+      return signal.numberA > 0;
+    case 'p':  // p,CH,WIDTHUS,IDLEHIGH
+      if (count != 4) return false;
+      signal.numberA = atol(fields[2]);
+      signal.flagA = fields[3][0] == '1';
+      return true;
+    case 'n':  // n,CH,COUNT,MAXUS,IDLEHIGH
+      if (count != 5) return false;
+      signal.numberA = atol(fields[2]);
+      signal.numberB = atol(fields[3]);
+      signal.flagA = fields[4][0] == '1';
+      return signal.numberB > 0;
+    case 'b':  // b,CH,PULSES,HALFUS
+      if (count != 4) return false;
+      signal.numberA = atol(fields[2]);
+      signal.numberB = atol(fields[3]);
+      return true;
+    case 'd':  // d,CH,LEVEL
+      if (count != 3) return false;
+      signal.flagA = fields[2][0] == '1';
+      return true;
+    default:
+      return false;
+  }
+}
+
+static void applyIdleLevels() {
+  for (uint8_t pin : CHANNEL_PINS) {
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, LOW);
+  }
+  for (uint8_t i = 0; i < scenarioCount; i++) {
+    const ScenarioSignal &signal = scenario[i];
+    switch (signal.kind) {
+      case 'u': digitalWrite(signal.pinA, signal.flagA ? LOW : HIGH); break;
+      case 's':
+        digitalWrite(signal.pinA, signal.flagA ? HIGH : LOW);
+        if (signal.pinC != 0xFF) digitalWrite(signal.pinC, signal.flagC ? LOW : HIGH);
+        break;
+      case 'i':
+        digitalWrite(signal.pinA, HIGH);
+        digitalWrite(signal.pinB, HIGH);
+        break;
+      case 'p':
+      case 'n':
+      case 'd': digitalWrite(signal.pinA, signal.flagA ? HIGH : LOW); break;
+      default: break;
+    }
+  }
+  for (uint8_t i = 0; i < scenarioCount; i++) {
+    const ScenarioSignal &signal = scenario[i];
+    if (signal.kind == 'w') {
+      uint32_t period = 1000000UL / signal.numberA;
+      uint32_t high = period * signal.numberB / 100;
+      startWaveform(signal.pinA, high, period - high, 0);
+    }
+  }
+}
+
+// x|GAPMS|SIGNAL|SIGNAL...
+static void loadScenario() {
+  Serial.setTimeout(1000);
+  String line = Serial.readStringUntil('\n');
+  char *text = line.begin();
+  char *saved = nullptr;
+  char *field = strtok_r(text, "|", &saved);
+  uint32_t gap = field ? atol(field) : 20;
+  uint8_t count = 0;
+  bool valid = field != nullptr;
+  while (valid && (field = strtok_r(nullptr, "|", &saved)) != nullptr) {
+    valid = count < MAX_SCENARIO_SIGNALS && parseScenarioSignal(field, scenario[count]);
+    count++;
+  }
+  if (!valid || count == 0) {
+    Serial.println("scenario bad");
+    return;
+  }
+  stopAllWaveforms();
+  activeVariant = nullptr;
+  scenarioCount = count;
+  scenarioGapMs = gap;
+  applyIdleLevels();
+  Serial.print("scenario ");
+  Serial.println(count);
+}
+
+static void leaveScenario() {
+  if (scenarioCount == 0) {
+    return;
+  }
+  stopAllWaveforms();
+  scenarioCount = 0;
+  pinMode(PIN_SYNC, OUTPUT);
+  digitalWrite(PIN_SYNC, LOW);
+  pinMode(PIN_SDA, OUTPUT);
+  pinMode(PIN_SCL, OUTPUT);
+  digitalWrite(PIN_SDA, HIGH);
+  digitalWrite(PIN_SCL, HIGH);
+}
+
 static void useVariant(const Variant &variant) {
+  leaveScenario();
   // The PWM interrupt cannot be masked and would disturb bit-banged timing.
   analogWrite(PIN_PWM, 0);
   pinMode(PIN_UART, OUTPUT);
@@ -295,7 +614,12 @@ static void useRandomUart(bool fastest) {
 static void handleCommands() {
   while (Serial.available() > 0) {
     char key = static_cast<char>(Serial.read());
+    if (key == 'x') {
+      loadScenario();
+      continue;
+    }
     if (key == 'c') {
+      leaveScenario();
       useHardwarePeripherals();
       // SPI.begin() takes this pin for MISO, and analogWrite will not take it back.
       pinMode(PIN_PWM, OUTPUT);
@@ -329,6 +653,8 @@ void setup() {
   WiFi.mode(WIFI_OFF);
   WiFi.forceSleepBegin();
 
+  // Scenario lines arrive while traffic is being bit-banged with interrupts held off.
+  Serial.setRxBufferSize(1024);
   Serial.begin(115200);
 
   pinMode(PIN_SYNC, OUTPUT);
@@ -345,11 +671,15 @@ void setup() {
   analogWrite(PIN_PWM, 250);
 
   Serial.println();
-  Serial.println("testgen v3 running");
+  Serial.println("testgen v4 running");
 }
 
 void loop() {
   handleCommands();
+  if (scenarioCount > 0) {
+    playScenario();
+    return;
+  }
   pulseSync();
   if (activeVariant == nullptr) {
     sendUART();

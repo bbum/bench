@@ -53,7 +53,7 @@ func withTestgenReply<Result>(mode: Character, body: (String) async throws -> Re
 
     // Opening the port usually resets the board, but not always, so the banner is
     // optional. Selecting a mode is what proves the board is listening.
-    _ = try? waitFor("testgen v3 running", seconds: 3)
+    _ = try? waitFor("testgen v4 running", seconds: 3)
     let reply = try select(mode)
     // Lets any frame in flight from the previous mode finish.
     usleep(100_000)

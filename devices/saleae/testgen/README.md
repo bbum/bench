@@ -43,6 +43,9 @@ and stop the PWM.
 | `p` | 8E1: `44`, `45` with wrong parity    | Mode 0                  | Clean                      |
 | `r` | Random baud, parity, stop bits, inversion and 32 bytes | Mode 0 | Clean                |
 
+`x` plays a scenario, which puts any signal on any pin. `tools/blind_test.py` generates
+them and keeps the answers, so `make blind ARGS="--runs 40"` scores `sal identify` blind.
+
 `r` first replies with the choices, as `random baud=57600 parity=E stop=2 inverted=1 data=<hex>`,
 so a test can compare them with what a blind analysis of the wires concludes. `R` is the
 same at a nominal 921600 baud. The bit-banged signal jitters by up to a quarter of a bit

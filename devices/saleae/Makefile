@@ -3,7 +3,7 @@ BINDIR ?= $(PREFIX)/bin
 CONFIG ?= release
 GENERATED := Sources/sal/Generated
 
-.PHONY: build test verify coverage mutation install proto clean
+.PHONY: build test verify coverage mutation blind install proto clean
 
 build:
 	swift build -c $(CONFIG)
@@ -28,6 +28,11 @@ coverage:
 		.build/debug/salTests.xctest/Contents/MacOS/salTests \
 		-instr-profile=.build/debug/codecov/default.profdata \
 		-ignore-filename-regex='(\.build|Generated|Tests)/'
+
+# Scores sal identify against random signals on all 8 testgen pins. Needs Logic 2 and testgen.
+blind:
+	swift build
+	python3 -I tools/blind_test.py $(ARGS)
 
 install: build
 	@mkdir -p $(BINDIR)
