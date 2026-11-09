@@ -28,8 +28,8 @@ capture, glitch filters, trim and the buffer limit, on both `capture` and `decod
 
 Phase 4, channel identification: `sal identify` names each bus from timing, then confirms
 it with Logic 2's decoders on the same capture. All 40,320 relabelings of the recorded
-channels are identified offline, and `testgen`'s random mode checks UART blind. Still
-to prove: a run with real jumpers swapped on the hardware.
+channels are identified offline, `testgen`'s random mode checks UART blind, and a run
+with three pairs of probes physically swapped was identified correctly.
 
 ## Phase 5: Analog
 
