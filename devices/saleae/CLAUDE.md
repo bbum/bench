@@ -4,7 +4,7 @@
 a CLI today and will grow an MCP server. First target is the Logic Pro 8.
 
 Status: `sal status` and `sal capture` (timed digital capture with a per-channel
-summary) work. Protocol decoding and MCP are not built yet.
+summary) work. Protocol decoding and MCP are not built yet. See PLAN.md for the phases.
 
 ## Build
 
