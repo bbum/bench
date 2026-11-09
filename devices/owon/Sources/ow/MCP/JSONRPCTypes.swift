@@ -124,7 +124,8 @@ enum JSONValue: Codable, Sendable {
     var intValue: Int? {
         switch self {
         case .int(let i): return i
-        case .double(let d): return Int(d)
+        // Int(d) would trap on NaN, infinity, or anything too large for Int.
+        case .double(let d): return Int(exactly: d.rounded(.towardZero))
         case .string(let s): return Int(s)
         default: return nil
         }
