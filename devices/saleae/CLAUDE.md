@@ -25,8 +25,9 @@ sal mcp          # MCP server over stdio
 make proto       # regenerate Sources/sal/Generated; needs protoc
 ```
 
-Logic 2 must be running with the automation server on (Settings > Automation, or
-launch with `--automation`). It listens on 127.0.0.1:10430.
+`sal` starts Logic 2 when it is not running, with `--automation --automationPort`, and
+connects to 127.0.0.1:10430. `--no-launch` or `SAL_NO_LAUNCH=1` prevents that.
+`sal app restart` is the cure when Logic 2 hangs.
 
 ## Testing
 
@@ -35,8 +36,10 @@ Tested the way SQLite is. New parsing or analysis code ships with all of these:
 - **Coverage:** `make coverage` reports region coverage of hand-written code. Swift
   tooling has no MC/DC or branch data, so regions are the measure.
 - **Mutation:** `make mutation` injects bugs from `tools/mutation_test.py` one at a
-  time, and the offline tests must catch each. Add mutants for new logic. Takes 20
-  minutes or more, so run it on demand, not routinely.
+  time, and the offline tests must catch each. It works in a copy of the package under
+  `~/Library/Caches/sal-mutation`, never in this tree. Add mutants for new logic, and
+  check just those with `make mutation ARGS="words"`. Takes 20 minutes or more, so run
+  it on demand, not routinely.
 - **Boundaries:** test both sides of every threshold.
 - **Corrupt input:** every truncation, every header byte value, hostile values in every
   field, and seeded random corruption. Must reject or summarize, never trap.
@@ -62,6 +65,19 @@ Tested the way SQLite is. New parsing or analysis code ships with all of these:
 
 ## Landmines
 
+- Logic 2 can run out of memory under automation and hang: it accepts connections and
+  answers nothing. It died at 5.8 GB after 518 captures in 23 hours, with four old
+  captures still open in tabs and two blind replays running at once. Work swells it by
+  a gigabyte or more for a while (0.9 to 2.2 GB across six identifies), so two clients
+  at once double that. Run `sal app restart --if-needed` between long batches, as
+  `tools/blind_test.py` does. `sal status` shows its memory.
+- The API cannot list or close another client's captures, so one that `sal` did not get
+  to close (killed outright, or after the buffer limit) stays until Logic 2 restarts.
+- Only parsed commands start Logic 2. Library calls default to `launchIfNeeded: false`,
+  so tests never do, and `make test` and `make mutation` set `SAL_NO_LAUNCH` so a mutant
+  cannot either. A hung Logic 2 is reported, never restarted unasked.
+- Every backend call but WaitCapture carries a limit (`.control` 30 s, `.data` 5 min).
+  A new call needs one too.
 - Analyzer setting names appear in neither the MCP schema nor the proto. They must
   match the names in Logic 2's UI. Confirmed working on Logic 2.4.48, as channel
   numbers unless noted:
@@ -82,7 +98,10 @@ Tested the way SQLite is. New parsing or analysis code ships with all of these:
 - Reaching the buffer limit fails WaitCapture and CloseCapture. `make verify` does this
   on purpose, so a "Capture Stopped" dialog appearing in Logic 2 is expected.
 - `sal identify` limits, which it reports as notes: timing cannot show MOSI from MISO,
-  UART TX from RX, word size, stop bits or bit order, and idle lines show nothing.
+  UART TX from RX, word size, stop bits or bit order, and idle lines show nothing. A line
+  in step with another channel's clock is clocked data and is never called UART. The
+  capture window's quiet before the first edge and after the last is evidence: synthetic
+  test channels must carry a window (`begin`/`end`), or a lone transfer looks cut.
 - UART pauses between frames can be any length, so only time away from idle has to be
   whole bits. A capture opening mid-frame misdecodes until the next gap longer than a
   frame, so confirmation ignores rows before that gap.
@@ -105,5 +124,14 @@ Tested the way SQLite is. New parsing or analysis code ships with all of these:
   expected values for each channel, and the modes selected over USB serial. Opening
   the port usually resets the board and closing it does not, so tests select a mode
   and restore clean mode.
+- Scenarios (`x`) play every signal from one scheduled timeline with interrupts off, so
+  signals overlap and timing is exact. The host must wait for `ready` before sending
+  the line. PWM's unmaskable interrupt still delays the odd edge by up to 8 us, so
+  `blind_test.py` keeps UART at or under 57600 and SPI half periods at or over 5 us
+  when PWM is present.
+- Blind captures carry their answer key beside them (`run-S-N.json`). Replay reads the
+  key, never the seed, so the generator can change without losing old captures.
+  `.blind/seed-7` is the v4 firmware's sequential signals, `.blind/seed-12` v5's
+  overlapping ones.
 - `testgen/hla/` is a small high level analyzer that the live tests run through Logic 2.
 - `proto/` is a verbatim copy of upstream. See `proto/UPSTREAM`.

@@ -3,9 +3,15 @@ import Synchronization
 import Testing
 @testable import sal
 
-private func channel(_ number: UInt32, initial: Int32, _ times: [Double]) throws -> IdentifiableChannel {
-    IdentifiableChannel(
-        summary: summarize(try parse(digitalFile(initial: initial, times: times)), channel: number), times: times)
+/// A channel in a capture that began at zero and ran on a second past its last edge, unless
+/// the window is given. Generated edges start at 1 s, so there is quiet on both sides.
+private func channel(
+    _ number: UInt32, initial: Int32, _ times: [Double], begin: Double = 0, end: Double? = nil
+) throws -> IdentifiableChannel {
+    let end = end ?? (times.last ?? begin) + 1
+    let digital = try parse(digitalFile(initial: initial, begin: begin, end: end, times: times))
+    return IdentifiableChannel(
+        summary: summarize(digital, channel: number), times: times, beginTime: digital.beginTime, endTime: digital.endTime)
 }
 
 /// Serial frames at `bit` seconds, resting high unless inverted.
@@ -166,7 +172,7 @@ struct RecordedIdentificationTests {
             Issue.record("not identified as UART: \(result)")
             return
         }
-        #expect(abs(Double(uart.baud) - 921_600) <= 921_600 * 0.07)
+        #expect(uart.baud == 921_600)
         #expect(!uart.inverted)
     }
 
@@ -469,6 +475,108 @@ struct IdentificationRuleTests {
         #expect(result.buses.map(\.decoder) == [.i2c(I2CDecoder(sda: sdaIndex, scl: sclIndex))])
     }
 
+    @Test("An SPI enable line around a clock idling high is not SDA")
+    func spiEnableIsNotSDA() throws {
+        // 64 rising edges plus the one that ends the frame: the shape of 7 I2C bytes and a stop.
+        var clock: [Double] = []
+        var enable: [Double] = []
+        var now = 1.0
+        for burst in 0..<6 {
+            enable.append(now)
+            now += 1e-6
+            for _ in 0..<64 {
+                clock += [now, now + 1e-6]
+                now += 2e-6
+            }
+            enable.append(now + 1e-6)
+            // Unevenly spaced, so the enable does not look periodic and is weighed as SDA.
+            now += 1e-3 * (1 + Double(burst) * 0.15)
+        }
+        let result = identifyChannels([try channel(0, initial: 1, enable), try channel(1, initial: 1, clock)])
+        #expect(!result.buses.contains { $0.decoder.kind == "i2c" })
+    }
+
+    @Test("Two PWMs are not an I2C bus")
+    func pwmPair() throws {
+        let first = squareWave(periods: 200, high: 30e-6, low: 270e-6)
+        let second = squareWave(periods: 60, high: 996e-6, low: 332e-6)
+        let result = identifyChannels([try channel(5, initial: 1, first), try channel(6, initial: 1, second)])
+        #expect(!result.buses.contains { $0.decoder.kind == "i2c" })
+        #expect(result.periodic.map(\.channel) == [5, 6])
+    }
+
+    @Test("Two PWMs from one timer, locked so that every period reads as a whole I2C byte, are still PWMs")
+    func lockedPWMPair() throws {
+        // 1 kHz falling while a 10 kHz clock is high, rising while it is low, with nine clock
+        // rises in between: the shape of a start, one byte and a repeated start, every time.
+        var slow: [Double] = []
+        var fast: [Double] = []
+        var now = 1.0
+        for _ in 0..<60 {
+            slow += [now + 60e-6, now + 310e-6]
+            for pulse in 0..<10 { fast += [now + Double(pulse) * 100e-6, now + Double(pulse) * 100e-6 + 50e-6] }
+            now += 1e-3
+        }
+        let result = identifyChannels([try channel(5, initial: 0, slow), try channel(6, initial: 0, fast)])
+        #expect(!result.buses.contains { $0.decoder.kind == "i2c" })
+        #expect(result.periodic.map(\.channel) == [5, 6])
+    }
+
+    @Test("A clock with uneven high and low times is still a clock")
+    func lopsidedClock() throws {
+        var clock: [Double] = []
+        var data: [Double] = []
+        var now = 1.0
+        for _ in 0..<8 {
+            for bit in 0..<32 {
+                clock += [now, now + 5.2e-6]
+                if bit.isMultiple(of: 3) { data.append(now + 6e-6) }
+                now += 8.4e-6
+            }
+            now += 2e-3
+        }
+        let result = identifyChannels([try channel(0, initial: 0, clock), try channel(1, initial: 0, data)])
+        #expect(result.buses.first?.decoder.kind == "spi")
+    }
+
+    @Test("A bare clock with a stray stretched pulse is not UART")
+    func clockWithOutlier() throws {
+        var times: [Double] = []
+        var now = 1.0
+        for burst in 0..<8 {
+            for pulse in 0..<20 {
+                let high = burst == 3 && pulse == 7 ? 26.8e-6 : 13.4e-6
+                times += [now, now + high]
+                now += high + 13.4e-6
+            }
+            now += 1e-3
+        }
+        let result = identifyChannels([try channel(3, initial: 0, times)])
+        #expect(!result.buses.contains { $0.decoder.kind == "uart" })
+    }
+
+    @Test("A bare clock is not UART, however it is timed")
+    func bareClockIsNotUART() throws {
+        var times: [Double] = []
+        var now = 1.0
+        for _ in 0..<8 {
+            for _ in 0..<13 {
+                // High for one bit and low for nearly two, as bit-banging tends to do.
+                times += [now, now + 5e-6]
+                now += 13e-6
+            }
+            now += 1e-3
+        }
+        let result = identifyChannels([try channel(3, initial: 0, times)])
+        #expect(!result.buses.contains { $0.decoder.kind == "uart" })
+    }
+
+    @Test("A rate 3% from a standard one is reported as measured")
+    func noSnapPastTolerance() throws {
+        let result = identifyChannels([try channel(2, initial: 1, uartTimes(text, bit: 1 / 119_000.0))])
+        #expect(abs(Double(try uart(result).baud) - 119_000) < 400)
+    }
+
     @Test("One transaction is uncertain")
     func i2cThin() throws {
         let waves = i2cWaves(transactions: 1)
@@ -479,11 +587,21 @@ struct IdentificationRuleTests {
 
     @Test("One transaction of mostly zeros is still I2C, though SDA rests low within it")
     func i2cMostlyZeros() throws {
+        // A window tight around the transaction, so no quiet either side shows SDA resting high.
         let waves = i2cWaves(transactions: 1, bytes: [0x55, 0x00, 0x00, 0x00])
-        let sda = try channel(0, initial: 1, waves.sda)
+        let begin = waves.sda[0] - 1e-6
+        let end = waves.sda.last! + 1e-6
+        let sda = try channel(0, initial: 1, waves.sda, begin: begin, end: end)
         #expect(sda.restingLevel == 0)
-        let result = identifyChannels([sda, try channel(1, initial: 1, waves.scl)])
+        let result = identifyChannels([sda, try channel(1, initial: 1, waves.scl, begin: begin, end: end)])
         #expect(result.buses.first?.decoder == .i2c(I2CDecoder(sda: 0, scl: 1)))
+    }
+
+    @Test("With quiet before it alone, the same SDA is seen to rest high")
+    func i2cMostlyZerosWithQuiet() throws {
+        let waves = i2cWaves(transactions: 1, bytes: [0x55, 0x00, 0x00, 0x00])
+        // The capture ends on the last edge, so only the second of quiet before the first one tells.
+        #expect(try channel(0, initial: 1, waves.sda, end: waves.sda.last!).restingLevel == 1)
     }
 
     @Test("Two I2C buses are reported with the ambiguity stated")

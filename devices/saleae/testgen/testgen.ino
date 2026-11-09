@@ -3,6 +3,7 @@
 
 #include <ESP8266WiFi.h>
 #include <SPI.h>
+#include <algorithm>
 #include <core_esp8266_waveform.h>
 
 static const uint8_t PIN_PWM = 12;
@@ -57,12 +58,23 @@ static const uint8_t MAX_SCENARIO_BYTES = 32;
 
 struct ScenarioSignal {
   char kind;
-  uint8_t pinA, pinB, pinC;
+  uint8_t pinA, pinB, pinC, pinD;
+  // Microseconds into each cycle at which the signal starts.
+  uint32_t offset;
   uint32_t numberA, numberB, numberC;
-  bool flagA, flagB, flagC;
+  bool flagA, flagB, flagC, flagD;
   char parity;
   uint8_t dataLength;
   uint8_t data[MAX_SCENARIO_BYTES];
+  uint8_t replyLength;
+  uint8_t reply[MAX_SCENARIO_BYTES];
+};
+
+// One change of pin levels, at a time counted in CPU cycles from the start of a cycle.
+struct ScheduledEdge {
+  uint32_t at;
+  uint16_t set;
+  uint16_t clear;
 };
 
 static const UartFormat FORMAT_8N1 = {8, 'N', 2, false, false};
@@ -271,13 +283,44 @@ static void useHardwarePeripherals() {
   activeVariant = nullptr;
 }
 
-// Scenarios put any signal on any pin. A host chooses them and keeps the answer, so
-// analysis of the wires can be scored blind. See tools/blind_test.py.
+// Scenarios put any signal on any pin, and any number of them at once. A host chooses
+// them and keeps the answer, so analysis of the wires can be scored blind. See
+// tools/blind_test.py.
+//
+// Every signal's edges go onto one timeline, which is then played back against the CPU
+// cycle counter with interrupts off. That is what lets signals overlap, and it makes
+// their timing exact to a fraction of a microsecond.
 static const uint8_t CHANNEL_PINS[8] = {12, 16, 2, 14, 13, 15, 4, 5};
 static const uint8_t MAX_SCENARIO_SIGNALS = 8;
 static ScenarioSignal scenario[MAX_SCENARIO_SIGNALS];
 static uint8_t scenarioCount = 0;
 static uint32_t scenarioGapMs = 20;
+
+static const uint32_t CYCLES_PER_US = F_CPU / 1000000;
+static const uint16_t MAX_EDGES = 1800;
+static ScheduledEdge edges[MAX_EDGES];
+static uint16_t edgeCount = 0;
+static bool edgesOverflowed = false;
+// Noise is drawn afresh each cycle, so a scenario with any is scheduled again each time.
+static bool scenarioHasNoise = false;
+
+// GPIO16 has a register of its own. GPIO0 carries no channel, so its bit stands in.
+static const uint16_t GPIO16_BIT = 1;
+
+static uint16_t pinBit(uint8_t pin) {
+  return pin == 16 ? GPIO16_BIT : static_cast<uint16_t>(1 << pin);
+}
+
+static void addEdge(uint32_t at, uint8_t pin, bool high) {
+  if (edgeCount == MAX_EDGES) {
+    edgesOverflowed = true;
+    return;
+  }
+  ScheduledEdge &edge = edges[edgeCount++];
+  edge.at = at;
+  edge.set = high ? pinBit(pin) : 0;
+  edge.clear = high ? 0 : pinBit(pin);
+}
 
 static void stopAllWaveforms() {
   for (uint8_t pin : CHANNEL_PINS) {
@@ -287,125 +330,179 @@ static void stopAllWaveforms() {
   }
 }
 
-static void pinHalfPeriod(uint32_t micros) {
-  delayMicroseconds(micros);
-}
-
-static void playUart(const ScenarioSignal &signal) {
-  UartFormat format = {8, signal.parity, static_cast<uint8_t>(signal.numberB), false, signal.flagA};
-  uartActivePin = signal.pinA;
-  uartBitCycles = F_CPU / signal.numberA;
+static void scheduleUart(const ScenarioSignal &signal) {
+  const uint32_t bit = F_CPU / signal.numberA;
+  const bool inverted = signal.flagA;
+  uint32_t at = signal.offset * CYCLES_PER_US;
   for (uint8_t i = 0; i < signal.dataLength; i++) {
-    uartFrame(format, signal.data[i]);
+    uint8_t ones = 0;
+    addEdge(at, signal.pinA, inverted);
+    at += bit;
+    for (uint8_t index = 0; index < 8; index++) {
+      bool value = (signal.data[i] >> index) & 1;
+      ones += value;
+      addEdge(at, signal.pinA, value != inverted);
+      at += bit;
+    }
+    if (signal.parity != 'N') {
+      bool parity = ((ones & 1) != 0) != (signal.parity == 'O');
+      addEdge(at, signal.pinA, parity != inverted);
+      at += bit;
+    }
+    addEdge(at, signal.pinA, !inverted);
+    // Not a whole number of bits to the next frame, as with a real sender.
+    at += bit * signal.numberB / 2 + 30 * CYCLES_PER_US;
   }
-  uartActivePin = PIN_UART;
-  uartBitCycles = DEFAULT_UART_BIT_CYCLES;
 }
 
-static void playSpi(const ScenarioSignal &signal) {
-  const bool cpol = signal.flagA, cpha = signal.flagB, csHigh = signal.flagC;
-  const uint32_t half = signal.numberA;
-  digitalWrite(signal.pinA, cpol ? HIGH : LOW);
-  if (signal.pinC != 0xFF) {
-    digitalWrite(signal.pinC, csHigh ? HIGH : LOW);
-    pinHalfPeriod(half);
+// Data follows the clock edge that moves it by a couple of CPU cycles, as it does out of
+// a hardware peripheral. MISO, when wired, sends its own bytes and may be let go to a
+// pull-up between transfers. Bytes may be paused apart, which splits the clock into bursts.
+static void scheduleSpi(const ScenarioSignal &signal) {
+  const bool cpol = signal.flagA, cpha = signal.flagB, csHigh = signal.flagC, released = signal.flagD;
+  const uint8_t clockPin = signal.pinA, mosi = signal.pinB, miso = signal.pinC, cs = signal.pinD;
+  const uint32_t half = signal.numberA * CYCLES_PER_US;
+  uint32_t at = signal.offset * CYCLES_PER_US;
+  if (cs != 0xFF) {
+    addEdge(at, cs, csHigh);
+    if (miso != 0xFF && released) {
+      addEdge(at + 4, miso, false);
+    }
+    at += signal.numberB * CYCLES_PER_US;
   }
   for (uint8_t i = 0; i < signal.dataLength; i++) {
     for (int bit = 7; bit >= 0; bit--) {
-      bool level = (signal.data[i] >> bit) & 1;
-      if (!cpha) {
-        digitalWrite(signal.pinB, level ? HIGH : LOW);
-        pinHalfPeriod(half);
-        digitalWrite(signal.pinA, cpol ? LOW : HIGH);
-        pinHalfPeriod(half);
-        digitalWrite(signal.pinA, cpol ? HIGH : LOW);
-      } else {
-        digitalWrite(signal.pinA, cpol ? LOW : HIGH);
-        digitalWrite(signal.pinB, level ? HIGH : LOW);
-        pinHalfPeriod(half);
-        digitalWrite(signal.pinA, cpol ? HIGH : LOW);
-        pinHalfPeriod(half);
+      bool out = (signal.data[i] >> bit) & 1;
+      bool in = signal.replyLength > 0 && ((signal.reply[i % signal.replyLength] >> bit) & 1);
+      uint32_t moves = cpha ? at + half : at;
+      if (cpha) {
+        addEdge(at + half, clockPin, !cpol);
       }
+      addEdge(moves + 2, mosi, out);
+      if (miso != 0xFF) {
+        addEdge(moves + 4, miso, in);
+      }
+      if (!cpha) {
+        addEdge(at + half, clockPin, !cpol);
+      }
+      addEdge(at + 2 * half, clockPin, cpol);
+      at += 2 * half;
+    }
+    if (i + 1 < signal.dataLength) {
+      at += signal.numberC * CYCLES_PER_US;
     }
   }
-  if (signal.pinC != 0xFF) {
-    pinHalfPeriod(half);
-    digitalWrite(signal.pinC, csHigh ? LOW : HIGH);
+  if (cs != 0xFF) {
+    at += half;
+    addEdge(at, cs, !csHigh);
+    if (miso != 0xFF && released) {
+      addEdge(at + 4, miso, true);
+    }
   }
 }
 
-static void i2cBit(const ScenarioSignal &signal, bool level) {
-  digitalWrite(signal.pinA, level ? HIGH : LOW);
-  pinHalfPeriod(signal.numberA);
-  digitalWrite(signal.pinB, HIGH);
-  pinHalfPeriod(signal.numberA);
-  digitalWrite(signal.pinB, LOW);
-}
-
-static void i2cOutByte(const ScenarioSignal &signal, uint8_t value) {
-  for (int bit = 7; bit >= 0; bit--) {
-    i2cBit(signal, (value >> bit) & 1);
+static void scheduleI2cByte(const ScenarioSignal &signal, uint8_t value, uint32_t half, uint32_t hold, uint32_t &at) {
+  for (int bit = 8; bit >= 0; bit--) {
+    // The ninth bit is the ACK, which the generator drives low itself.
+    bool level = bit > 0 && ((value >> (bit - 1)) & 1);
+    addEdge(at + hold, signal.pinA, level);
+    addEdge(at + half, signal.pinB, true);
+    addEdge(at + 2 * half, signal.pinB, false);
+    at += 2 * half;
   }
-  i2cBit(signal, false);
 }
 
-static void playI2c(const ScenarioSignal &signal) {
-  digitalWrite(signal.pinA, LOW);
-  pinHalfPeriod(signal.numberA);
-  digitalWrite(signal.pinB, LOW);
-  pinHalfPeriod(signal.numberA);
-  i2cOutByte(signal, static_cast<uint8_t>(signal.numberB) << 1);
+static void scheduleI2c(const ScenarioSignal &signal) {
+  const uint32_t half = signal.numberA * CYCLES_PER_US;
+  // SDA changes a little after SCL falls, as devices are required to allow for.
+  const uint32_t hold = std::min<uint32_t>(half / 4, CYCLES_PER_US);
+  uint32_t at = signal.offset * CYCLES_PER_US;
+  addEdge(at, signal.pinA, false);
+  at += half;
+  addEdge(at, signal.pinB, false);
+  scheduleI2cByte(signal, static_cast<uint8_t>(signal.numberB) << 1, half, hold, at);
   for (uint8_t i = 0; i < signal.dataLength; i++) {
-    i2cOutByte(signal, signal.data[i]);
+    scheduleI2cByte(signal, signal.data[i], half, hold, at);
   }
-  digitalWrite(signal.pinA, LOW);
-  pinHalfPeriod(signal.numberA);
-  digitalWrite(signal.pinB, HIGH);
-  pinHalfPeriod(signal.numberA);
-  digitalWrite(signal.pinA, HIGH);
-  pinHalfPeriod(signal.numberA);
+  addEdge(at + hold, signal.pinA, false);
+  addEdge(at + half, signal.pinB, true);
+  addEdge(at + 2 * half, signal.pinA, true);
 }
 
-static void playPulse(const ScenarioSignal &signal) {
-  digitalWrite(signal.pinA, signal.flagA ? LOW : HIGH);
-  delayMicroseconds(signal.numberA);
-  digitalWrite(signal.pinA, signal.flagA ? HIGH : LOW);
+static void schedulePulse(const ScenarioSignal &signal) {
+  uint32_t at = signal.offset * CYCLES_PER_US;
+  addEdge(at, signal.pinA, !signal.flagA);
+  addEdge(at + signal.numberA * CYCLES_PER_US, signal.pinA, signal.flagA);
 }
 
-static void playNoise(const ScenarioSignal &signal) {
+static void scheduleNoise(const ScenarioSignal &signal) {
+  uint32_t at = signal.offset * CYCLES_PER_US;
   bool level = signal.flagA;
   for (uint32_t i = 0; i < signal.numberA; i++) {
     level = !level;
-    digitalWrite(signal.pinA, level ? HIGH : LOW);
-    delayMicroseconds(1 + ESP.random() % signal.numberB);
+    addEdge(at, signal.pinA, level);
+    at += (1 + ESP.random() % signal.numberB) * CYCLES_PER_US;
   }
-  digitalWrite(signal.pinA, signal.flagA ? HIGH : LOW);
+  addEdge(at, signal.pinA, signal.flagA);
 }
 
-static void playClockBurst(const ScenarioSignal &signal) {
+static void scheduleClockBurst(const ScenarioSignal &signal) {
+  const uint32_t half = signal.numberB * CYCLES_PER_US;
+  uint32_t at = signal.offset * CYCLES_PER_US;
   for (uint32_t i = 0; i < signal.numberA; i++) {
-    digitalWrite(signal.pinA, HIGH);
-    pinHalfPeriod(signal.numberB);
-    digitalWrite(signal.pinA, LOW);
-    pinHalfPeriod(signal.numberB);
+    addEdge(at, signal.pinA, true);
+    addEdge(at + half, signal.pinA, false);
+    at += 2 * half;
   }
 }
 
-static void playScenario() {
+// Returns false if the scenario has more edges than there is room for.
+static bool scheduleScenario() {
+  edgeCount = 0;
+  edgesOverflowed = false;
   for (uint8_t i = 0; i < scenarioCount; i++) {
     const ScenarioSignal &signal = scenario[i];
     switch (signal.kind) {
-      case 'u': playUart(signal); break;
-      case 's': playSpi(signal); break;
-      case 'i': playI2c(signal); break;
-      case 'p': playPulse(signal); break;
-      case 'n': playNoise(signal); break;
-      case 'b': playClockBurst(signal); break;
+      case 'u': scheduleUart(signal); break;
+      case 's': scheduleSpi(signal); break;
+      case 'i': scheduleI2c(signal); break;
+      case 'p': schedulePulse(signal); break;
+      case 'n': scheduleNoise(signal); break;
+      case 'b': scheduleClockBurst(signal); break;
       default: break;
     }
-    delayMicroseconds(100);
-    yield();
   }
+  std::sort(edges, edges + edgeCount, [](const ScheduledEdge &a, const ScheduledEdge &b) { return a.at < b.at; });
+  return !edgesOverflowed;
+}
+
+// Runs from RAM, because a flash fetch would be late enough to move an edge.
+static void IRAM_ATTR playEdges() {
+  noInterrupts();
+  const uint32_t start = ESP.getCycleCount();
+  for (uint16_t i = 0; i < edgeCount; i++) {
+    const ScheduledEdge &edge = edges[i];
+    while (static_cast<int32_t>(ESP.getCycleCount() - start - edge.at) < 0) {
+    }
+    const uint16_t set = edge.set & ~GPIO16_BIT, clear = edge.clear & ~GPIO16_BIT;
+    if (set) {
+      GPOS = set;
+    }
+    if (clear) {
+      GPOC = clear;
+    }
+    if ((edge.set | edge.clear) & GPIO16_BIT) {
+      GP16O = (edge.set & GPIO16_BIT) ? 1 : 0;
+    }
+  }
+  interrupts();
+}
+
+static void playScenario() {
+  if (scenarioHasNoise) {
+    scheduleScenario();
+  }
+  playEdges();
   delay(scenarioGapMs);
 }
 
@@ -427,12 +524,13 @@ static uint8_t channelPin(const char *text) {
   return channel >= 0 && channel < 8 ? CHANNEL_PINS[channel] : 0xFF;
 }
 
-// Fields are comma separated, positional, and described with each kind below.
+// Fields are comma separated, positional, and described with each kind below. OFFSET is
+// microseconds into the cycle.
 static bool parseScenarioSignal(char *text, ScenarioSignal &signal) {
-  char *fields[10];
+  char *fields[16];
   uint8_t count = 0;
   char *saved = nullptr;
-  for (char *field = strtok_r(text, ",", &saved); field && count < 10; field = strtok_r(nullptr, ",", &saved)) {
+  for (char *field = strtok_r(text, ",", &saved); field && count < 16; field = strtok_r(nullptr, ",", &saved)) {
     fields[count++] = field;
   }
   if (count < 2) {
@@ -442,51 +540,62 @@ static bool parseScenarioSignal(char *text, ScenarioSignal &signal) {
   signal.kind = fields[0][0];
   signal.pinA = channelPin(fields[1]);
   switch (signal.kind) {
-    case 'u':  // u,CH,BAUD,PARITY,STOPHALVES,INVERTED,HEX
-      if (count != 7) return false;
-      signal.numberA = atol(fields[2]);
-      signal.parity = fields[3][0];
-      signal.numberB = atol(fields[4]);
-      signal.flagA = fields[5][0] == '1';
-      signal.dataLength = parseHex(fields[6], signal.data);
+    case 'u':  // u,CH,OFFSET,BAUD,PARITY,STOPHALVES,INVERTED,HEX
+      if (count != 8) return false;
+      signal.offset = atol(fields[2]);
+      signal.numberA = atol(fields[3]);
+      signal.parity = fields[4][0];
+      signal.numberB = atol(fields[5]);
+      signal.flagA = fields[6][0] == '1';
+      signal.dataLength = parseHex(fields[7], signal.data);
       return signal.numberA > 0;
-    case 's':  // s,CLK,MOSI,CS or -1,CPOL,CPHA,HALFUS,CSHIGH,HEX
-      if (count != 9) return false;
+    case 's':  // s,CLK,MOSI,MISO or -1,CS or -1,OFFSET,CPOL,CPHA,HALFUS,CSHIGH,SETUPUS,PAUSEUS,RELEASED,HEX,REPLYHEX
+      if (count != 15) return false;
       signal.pinB = channelPin(fields[2]);
       signal.pinC = channelPin(fields[3]);
-      signal.flagA = fields[4][0] == '1';
-      signal.flagB = fields[5][0] == '1';
-      signal.numberA = atol(fields[6]);
-      signal.flagC = fields[7][0] == '1';
-      signal.dataLength = parseHex(fields[8], signal.data);
-      return true;
-    case 'i':  // i,SDA,SCL,HALFUS,ADDRESS,HEX
-      if (count != 6) return false;
+      signal.pinD = channelPin(fields[4]);
+      signal.offset = atol(fields[5]);
+      signal.flagA = fields[6][0] == '1';
+      signal.flagB = fields[7][0] == '1';
+      signal.numberA = atol(fields[8]);
+      signal.flagC = fields[9][0] == '1';
+      signal.numberB = atol(fields[10]);
+      signal.numberC = atol(fields[11]);
+      signal.flagD = fields[12][0] == '1';
+      signal.dataLength = parseHex(fields[13], signal.data);
+      signal.replyLength = parseHex(fields[14], signal.reply);
+      return signal.numberA > 0;
+    case 'i':  // i,SDA,SCL,OFFSET,HALFUS,ADDRESS,HEX
+      if (count != 7) return false;
       signal.pinB = channelPin(fields[2]);
-      signal.numberA = atol(fields[3]);
-      signal.numberB = strtol(fields[4], nullptr, 16);
-      signal.dataLength = parseHex(fields[5], signal.data);
-      return true;
+      signal.offset = atol(fields[3]);
+      signal.numberA = atol(fields[4]);
+      signal.numberB = strtol(fields[5], nullptr, 16);
+      signal.dataLength = parseHex(fields[6], signal.data);
+      return signal.numberA > 0;
     case 'w':  // w,CH,HZ,DUTYPERCENT
       if (count != 4) return false;
       signal.numberA = atol(fields[2]);
       signal.numberB = atol(fields[3]);
       return signal.numberA > 0;
-    case 'p':  // p,CH,WIDTHUS,IDLEHIGH
-      if (count != 4) return false;
-      signal.numberA = atol(fields[2]);
-      signal.flagA = fields[3][0] == '1';
-      return true;
-    case 'n':  // n,CH,COUNT,MAXUS,IDLEHIGH
+    case 'p':  // p,CH,OFFSET,WIDTHUS,IDLEHIGH
       if (count != 5) return false;
-      signal.numberA = atol(fields[2]);
-      signal.numberB = atol(fields[3]);
+      signal.offset = atol(fields[2]);
+      signal.numberA = atol(fields[3]);
       signal.flagA = fields[4][0] == '1';
+      return true;
+    case 'n':  // n,CH,OFFSET,COUNT,MAXUS,IDLEHIGH
+      if (count != 6) return false;
+      signal.offset = atol(fields[2]);
+      signal.numberA = atol(fields[3]);
+      signal.numberB = atol(fields[4]);
+      signal.flagA = fields[5][0] == '1';
       return signal.numberB > 0;
-    case 'b':  // b,CH,PULSES,HALFUS
-      if (count != 4) return false;
-      signal.numberA = atol(fields[2]);
-      signal.numberB = atol(fields[3]);
+    case 'b':  // b,CH,OFFSET,PULSES,HALFUS
+      if (count != 5) return false;
+      signal.offset = atol(fields[2]);
+      signal.numberA = atol(fields[3]);
+      signal.numberB = atol(fields[4]);
       return true;
     case 'd':  // d,CH,LEVEL
       if (count != 3) return false;
@@ -502,20 +611,25 @@ static void applyIdleLevels() {
     pinMode(pin, OUTPUT);
     digitalWrite(pin, LOW);
   }
+  scenarioHasNoise = false;
   for (uint8_t i = 0; i < scenarioCount; i++) {
     const ScenarioSignal &signal = scenario[i];
     switch (signal.kind) {
       case 'u': digitalWrite(signal.pinA, signal.flagA ? LOW : HIGH); break;
       case 's':
         digitalWrite(signal.pinA, signal.flagA ? HIGH : LOW);
-        if (signal.pinC != 0xFF) digitalWrite(signal.pinC, signal.flagC ? LOW : HIGH);
+        if (signal.pinC != 0xFF && signal.flagD) digitalWrite(signal.pinC, HIGH);
+        if (signal.pinD != 0xFF) digitalWrite(signal.pinD, signal.flagC ? LOW : HIGH);
         break;
       case 'i':
         digitalWrite(signal.pinA, HIGH);
         digitalWrite(signal.pinB, HIGH);
         break;
-      case 'p':
       case 'n':
+        scenarioHasNoise = true;
+        digitalWrite(signal.pinA, signal.flagA ? HIGH : LOW);
+        break;
+      case 'p':
       case 'd': digitalWrite(signal.pinA, signal.flagA ? HIGH : LOW); break;
       default: break;
     }
@@ -530,9 +644,12 @@ static void applyIdleLevels() {
   }
 }
 
-// x|GAPMS|SIGNAL|SIGNAL...
+// x, then once "ready" comes back, GAPMS|SIGNAL|SIGNAL... on one line. The line is only
+// sent after the reply because it is longer than the UART's own buffer, and a cycle that
+// is playing has interrupts off.
 static void loadScenario() {
-  Serial.setTimeout(1000);
+  Serial.println("ready");
+  Serial.setTimeout(2000);
   String line = Serial.readStringUntil('\n');
   char *text = line.begin();
   char *saved = nullptr;
@@ -545,6 +662,7 @@ static void loadScenario() {
     count++;
   }
   if (!valid || count == 0) {
+    scenarioCount = 0;
     Serial.println("scenario bad");
     return;
   }
@@ -553,8 +671,15 @@ static void loadScenario() {
   scenarioCount = count;
   scenarioGapMs = gap;
   applyIdleLevels();
+  if (!scheduleScenario()) {
+    scenarioCount = 0;
+    Serial.println("scenario bad: too many edges");
+    return;
+  }
   Serial.print("scenario ");
-  Serial.println(count);
+  Serial.print(count);
+  Serial.print(" edges ");
+  Serial.println(edgeCount);
 }
 
 static void leaveScenario() {
@@ -671,7 +796,7 @@ void setup() {
   analogWrite(PIN_PWM, 250);
 
   Serial.println();
-  Serial.println("testgen v4 running");
+  Serial.println("testgen v5 running");
 }
 
 void loop() {

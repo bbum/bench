@@ -110,7 +110,8 @@ func decodedRows(fromCSV bytes: Data) throws -> [DecodedRow] {
 }
 
 /// Counts protocol faults across all rows, so paging cannot hide one. A NACK on the last
-/// byte of an I2C read is how a controller ends the read, so it does not count.
+/// byte of an I2C read is how a controller ends the read, so it does not count. The SPI
+/// analyzer reports a clock resting at the wrong level as a row of its own, of type error.
 func decodeIssues(_ rows: [DecodedRow]) -> [String: Int] {
     var issues: [String: Int] = [:]
     for label in decodeIssueLabels(rows) {
@@ -125,6 +126,7 @@ func decodeIssueLabels(_ rows: [DecodedRow]) -> [String?] {
     return rows.map { row in
         if row.type == "address", let read = row.fields["read"] { reading = read == "true" }
         if let error = row.fields["error"] { return error }
+        if row.type == "error" { return "error" }
         if row.fields["ack"] == "false", row.type == "address" || !reading { return "nack" }
         return nil
     }

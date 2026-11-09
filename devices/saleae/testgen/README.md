@@ -43,10 +43,47 @@ and stop the PWM.
 | `p` | 8E1: `44`, `45` with wrong parity    | Mode 0                  | Clean                      |
 | `r` | Random baud, parity, stop bits, inversion and 32 bytes | Mode 0 | Clean                |
 
-`x` plays a scenario, which puts any signal on any pin. `tools/blind_test.py` generates
-them and keeps the answers, so `make blind ARGS="--runs 40"` scores `sal identify` blind.
+`x` plays a scenario, which puts any signal on any pin, several at once. See below.
 
 `r` first replies with the choices, as `random baud=57600 parity=E stop=2 inverted=1 data=<hex>`,
 so a test can compare them with what a blind analysis of the wires concludes. `R` is the
 same at a nominal 921600 baud. The bit-banged signal jitters by up to a quarter of a bit
-there and measures about 4% slow, so treat that rate as approximate.
+there. Its rate is within 0.1% of nominal, but every low pulse is about 36 ns long, so an
+average of pulse widths reads it 2% slow.
+
+## Scenarios
+
+`x` puts the board into scenario mode. It answers `ready`, and then takes one line:
+
+```
+GAPMS|SIGNAL|SIGNAL|...
+```
+
+Every signal's edges go onto one timeline, which is played against the CPU cycle counter
+with interrupts off, so signals overlap and their timing is exact to a fraction of a
+microsecond. A cycle plays the timeline and then waits `GAPMS`. The board answers
+`scenario N edges M`, or `scenario bad` if a field is wrong or there are more than 1800
+edges. `tools/blind_test.py` writes these lines and keeps the answers, so
+`make blind ARGS="--runs 40"` scores `sal identify` blind.
+
+Fields are comma separated and positional. Channels are 0 to 7, or -1 for a line that is
+not wired. `OFFSET` is microseconds into the cycle at which the signal starts.
+
+| Signal | Fields |
+|--------|--------|
+| UART | `u,CH,OFFSET,BAUD,PARITY,STOPHALVES,INVERTED,HEX` |
+| SPI | `s,CLK,MOSI,MISO,CS,OFFSET,CPOL,CPHA,HALFUS,CSHIGH,SETUPUS,PAUSEUS,RELEASED,HEX,REPLYHEX` |
+| I2C | `i,SDA,SCL,OFFSET,HALFUS,ADDRESS,HEX` |
+| PWM | `w,CH,HZ,DUTYPERCENT` |
+| Pulse | `p,CH,OFFSET,WIDTHUS,IDLEHIGH` |
+| Noise | `n,CH,OFFSET,COUNT,MAXUS,IDLEHIGH` |
+| Clock burst | `b,CH,OFFSET,PULSES,HALFUS` |
+| Idle | `d,CH,LEVEL` |
+
+SPI data moves a few CPU cycles after the clock edge that shifts it, as it does out of a
+peripheral. `SETUPUS` is how long the enable is asserted before the clock starts, and
+`PAUSEUS` an idle stretch between bytes. MISO sends `REPLYHEX`, and with `RELEASED` it is
+driven low while enabled and high otherwise, like a line let go to a pull-up. I2C's SDA
+changes a quarter of a half period after SCL falls, at most 1 us. Noise is drawn afresh
+each cycle. PWM runs from the waveform generator throughout, and its interrupt cannot be
+masked, so it delays the odd edge of everything else by up to 8 us.

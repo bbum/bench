@@ -59,17 +59,20 @@ protocol CaptureBackend: Sendable {
     func closeCapture(_ captureID: UInt64) async throws
 }
 
+/// Every call but the wait has a limit, so a Logic 2 that hangs partway through is an
+/// error and never a command that sits there. The wait is as long as the capture, so
+/// `runCapture` times it instead.
 struct GRPCCaptureBackend: CaptureBackend {
     let manager: Logic2Manager
 
     func startCapture(_ request: Saleae_Automation_StartCaptureRequest) async throws -> UInt64 {
-        try await manager.startCapture(request).captureInfo.captureID
+        try await manager.startCapture(request, options: .control).captureInfo.captureID
     }
 
     func stopCapture(_ captureID: UInt64) async throws {
         var stop = Saleae_Automation_StopCaptureRequest()
         stop.captureID = captureID
-        _ = try await manager.stopCapture(stop)
+        _ = try await manager.stopCapture(stop, options: .control)
     }
 
     func waitCapture(_ captureID: UInt64) async throws {
@@ -79,46 +82,46 @@ struct GRPCCaptureBackend: CaptureBackend {
     }
 
     func exportBinary(_ request: Saleae_Automation_ExportRawDataBinaryRequest) async throws {
-        _ = try await manager.exportRawDataBinary(request)
+        _ = try await manager.exportRawDataBinary(request, options: .data)
     }
 
     func addAnalyzer(_ request: Saleae_Automation_AddAnalyzerRequest) async throws -> UInt64 {
-        try await manager.addAnalyzer(request).analyzerID
+        try await manager.addAnalyzer(request, options: .control).analyzerID
     }
 
     func exportDataTable(_ request: Saleae_Automation_ExportDataTableCsvRequest) async throws {
-        _ = try await manager.exportDataTableCsv(request)
+        _ = try await manager.exportDataTableCsv(request, options: .data)
     }
 
     func addHighLevelAnalyzer(_ request: Saleae_Automation_AddHighLevelAnalyzerRequest) async throws -> UInt64 {
-        try await manager.addHighLevelAnalyzer(request).analyzerID
+        try await manager.addHighLevelAnalyzer(request, options: .control).analyzerID
     }
 
     func exportRawCSV(_ request: Saleae_Automation_ExportRawDataCsvRequest) async throws {
-        _ = try await manager.exportRawDataCsv(request)
+        _ = try await manager.exportRawDataCsv(request, options: .data)
     }
 
     func exportLegacy(_ request: Saleae_Automation_LegacyExportAnalyzerRequest) async throws {
-        _ = try await manager.legacyExportAnalyzer(request)
+        _ = try await manager.legacyExportAnalyzer(request, options: .data)
     }
 
     func saveCapture(_ captureID: UInt64, to path: String) async throws {
         var save = Saleae_Automation_SaveCaptureRequest()
         save.captureID = captureID
         save.filepath = path
-        _ = try await manager.saveCapture(save)
+        _ = try await manager.saveCapture(save, options: .data)
     }
 
     func loadCapture(_ path: String) async throws -> UInt64 {
         var load = Saleae_Automation_LoadCaptureRequest()
         load.filepath = path
-        return try await manager.loadCapture(load).captureInfo.captureID
+        return try await manager.loadCapture(load, options: .data).captureInfo.captureID
     }
 
     func closeCapture(_ captureID: UInt64) async throws {
         var close = Saleae_Automation_CloseCaptureRequest()
         close.captureID = captureID
-        _ = try await manager.closeCapture(close)
+        _ = try await manager.closeCapture(close, options: .control)
     }
 }
 
@@ -371,33 +374,92 @@ private func confirmed(
     var bus = bus
     switch bus.decoder {
     case .uart(let uart):
-        var lastErrors = 0
+        var best: (attempt: UARTDecoder, errors: Int, frames: Int)?
+        var decoded = 0
         for inverted in [uart.inverted, !uart.inverted] {
             for parity in Parity.allCases {
                 var attempt = uart
                 attempt.parity = parity
                 attempt.inverted = inverted
                 let rows = try await decodedRows(.uart(attempt), captureID: captureID, in: directory, using: backend)
-                let errors = decodeIssues(alignedFrames(rows, baud: uart.baud)).values.reduce(0, +)
-                if !rows.isEmpty, errors == 0 {
+                decoded = max(decoded, rows.count)
+                // Only frames the window cannot have spoiled say anything.
+                let frames = alignedFrames(rows, baud: uart.baud)
+                guard !frames.isEmpty else { continue }
+                let errors = decodeIssues(frames).values.reduce(0, +)
+                if errors == 0 {
                     bus.decoder = .uart(attempt)
+                    guard frames.count >= minimumConfirmingRows else {
+                        bus.notes.append(tooFew(frames.count, "frame", "could be checked"))
+                        return bus
+                    }
                     bus.confidence = .confirmed
+                    bus.evidence += ", \(frames.count) frames decoded cleanly"
                     return bus
                 }
-                lastErrors = errors
+                if errors < best?.errors ?? .max { best = (attempt, errors, frames.count) }
             }
         }
+        guard let best else {
+            if decoded == 0 {
+                bus.confidence = .uncertain
+                bus.notes.append("Logic 2 decoded no frames.")
+            } else {
+                bus.notes.append(tooFew(decoded, "frame", "decoded, and none could be checked"))
+            }
+            return bus
+        }
+        // One bad frame among fewer than four is already past the allowance.
+        if Double(best.errors) <= Double(best.frames) * tolerableFrameErrors {
+            bus.decoder = .uart(best.attempt)
+            bus.confidence = .confirmed
+            bus.evidence += ", \(best.frames) frames decoded"
+            bus.notes.append("\(best.errors) of \(best.frames) frames had errors.")
+            return bus
+        }
         bus.confidence = .uncertain
-        bus.notes.append("Decoding still reported \(lastErrors) errors with each parity and polarity. Check the frame format.")
+        bus.notes.append("Decoding still reported \(best.errors) errors at best. Check the frame format.")
     case .spi:
         let rows = try await decodedRows(bus.decoder, captureID: captureID, in: directory, using: backend)
-        confirm(&bus, found: rows.contains { $0.type == "result" }, failure: "Logic 2 decoded no SPI words.")
+        let words = rows.count { $0.type == "result" }
+        let errors = decodeIssues(rows).values.reduce(0, +)
+        if errors > 0 {
+            bus.confidence = .uncertain
+            bus.notes.append("Logic 2 reported \(errors) \(errors == 1 ? "error" : "errors") decoding it. Check the clock polarity.")
+        } else if words == 0 {
+            bus.confidence = .uncertain
+            bus.notes.append("Logic 2 decoded no SPI words.")
+        } else if words < minimumConfirmingRows {
+            bus.notes.append(tooFew(words, "word", "decoded"))
+        } else {
+            bus.confidence = .confirmed
+            bus.evidence += ", \(words) words decoded"
+        }
     case .i2c:
         let rows = try await decodedRows(bus.decoder, captureID: captureID, in: directory, using: backend)
-        confirm(&bus, found: rows.contains { $0.type == "address" }, failure: "Logic 2 decoded no I2C addresses.")
+        let addresses = rows.count { $0.type == "address" }
+        if addresses == 0 {
+            bus.confidence = .uncertain
+            bus.notes.append("Logic 2 decoded no I2C addresses.")
+        } else {
+            bus.confidence = .confirmed
+            bus.evidence += ", \(addresses) \(addresses == 1 ? "address" : "addresses") decoded"
+        }
         if let nacks = decodeIssues(rows)["nack"] { bus.notes.append("\(nacks) NACKs were seen.") }
     }
     return bus
+}
+
+/// A noisy line can spoil a few frames. The wrong format fails about half of them.
+private let tolerableFrameErrors = 0.05
+
+/// Fewest decoded frames or words that confirm a bus. Fewer can pass by luck: the wrong
+/// parity gets through one frame in two, so four clean frames are wrong one time in 16.
+let minimumConfirmingRows = 4
+
+/// Says the decoder agreed as far as it went, which was not far enough to call it confirmed.
+private func tooFew(_ count: Int, _ noun: String, _ what: String) -> String {
+    "Only \(count) \(noun)\(count == 1 ? "" : "s") \(what), too few to confirm."
 }
 
 /// Leaves out frames a capture window can spoil. A capture that opens mid-frame stays
@@ -409,11 +471,6 @@ func alignedFrames(_ rows: [DecodedRow], baud: Int64) -> [DecodedRow] {
     let start = firstGap.map { $0 + 1 } ?? 1
     let aligned = Array(rows.dropFirst(start).dropLast())
     return aligned.isEmpty ? Array(rows.dropFirst().dropLast()) : aligned
-}
-
-private func confirm(_ bus: inout IdentifiedBus, found: Bool, failure: String) {
-    bus.confidence = found ? .confirmed : .uncertain
-    if !found { bus.notes.append(failure) }
 }
 
 /// Runs a capture, decodes it, and writes the analyzer's data table to `file`.
@@ -526,6 +583,7 @@ func runCapture(
     _ request: DigitalCaptureRequest,
     using backend: some CaptureBackend,
     cancellation: CaptureCancellation,
+    waitGraceSeconds: Double = timedWaitGraceSeconds,
     process: (UInt64) async throws -> Void
 ) async throws {
     try cancellation.checkCancelled()
@@ -540,8 +598,9 @@ func runCapture(
         switch request.mode {
         case .load:
             break
-        case .timed:
-            try await cancellation.interruptible { try await backend.waitCapture(captureID) }
+        case .timed(let seconds, _):
+            try await waitForTimedCapture(
+                captureID, seconds: seconds, graceSeconds: waitGraceSeconds, using: backend, cancellation: cancellation)
         case .manual(let limitSeconds, _, let stop):
             try await holdManualCapture(limitSeconds: limitSeconds, stop: stop, cancellation: cancellation)
             try await backend.stopCapture(captureID)
@@ -579,6 +638,33 @@ private func holdManualCapture(
     try await cancellation.interruptible {
         // Reaching the limit and being stopped both end the capture normally.
         try? await stop.interruptible { try await Task.sleep(for: .seconds(limitSeconds ?? oneYear)) }
+    }
+}
+
+/// How long past its own duration a timed capture may take to report that it finished.
+let timedWaitGraceSeconds = 30.0
+
+/// A timed capture ends by itself, so one that has not is Logic 2 hanging.
+private func waitForTimedCapture(
+    _ captureID: UInt64,
+    seconds: Double,
+    graceSeconds: Double,
+    using backend: some CaptureBackend,
+    cancellation: CaptureCancellation
+) async throws {
+    let deadline = CaptureCancellation()
+    let watchdog = Task {
+        try await Task.sleep(for: .seconds(seconds + graceSeconds))
+        deadline.cancel()
+    }
+    defer { watchdog.cancel() }
+
+    do {
+        try await cancellation.interruptible {
+            try await deadline.interruptible { try await backend.waitCapture(captureID) }
+        }
+    } catch where deadline.isCancelled && !cancellation.isCancelled {
+        throw Logic2Error.stalled
     }
 }
 

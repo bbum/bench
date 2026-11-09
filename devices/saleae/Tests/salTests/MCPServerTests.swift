@@ -553,6 +553,45 @@ struct MCPToolInputTests {
         #expect(await message("decode", .object(["bus": bus])).contains("--baud"))
     }
 
+    @Test("The server's address fills in what a call leaves out")
+    func defaultEndpoint() {
+        let tools = SalTools(endpoint: Logic2Endpoint(host: "10.0.0.9", port: 12345, launchIfNeeded: true))
+        #expect(tools.withDefaultEndpoint(.object([:])) == .object(["host": .string("10.0.0.9"), "port": .int(12345)]))
+    }
+
+    @Test("A call's own address wins over the server's")
+    func callEndpointWins() {
+        let tools = SalTools(endpoint: Logic2Endpoint(host: "10.0.0.9", port: 12345, launchIfNeeded: true))
+        let result = tools.withDefaultEndpoint(.object(["host": .string("1.2.3.4"), "port": .int(7)]))
+        #expect(result == .object(["host": .string("1.2.3.4"), "port": .int(7)]))
+    }
+
+    @Test("Arguments that are not an object are left for validation to refuse")
+    func nonObjectEndpoint() {
+        #expect(SalTools().withDefaultEndpoint(.int(1)) == .int(1))
+    }
+
+    @Test("A tool reaches the server's configured address")
+    func configuredEndpointIsUsed() async {
+        let result = await message2(SalTools(endpoint: Logic2Endpoint(host: "127.0.0.1", port: 1)))
+        #expect(!result.hasPrefix("no error"))
+    }
+
+    private func message2(_ tools: SalTools) async -> String {
+        do {
+            return "no error: \(try await tools.call(name: "status", arguments: .object([:])))"
+        } catch {
+            return String(describing: error)
+        }
+    }
+
+    @Test("sal mcp accepts an address")
+    func mcpOptions() throws {
+        let command = try #require(try Sal.parseAsRoot(["mcp", "--host", "10.0.0.9", "--port", "12345"]) as? MCPCommand)
+        #expect(command.logic2.endpoint.host == "10.0.0.9")
+        #expect(command.logic2.endpoint.port == 12345)
+    }
+
     @Test("Command line validation reaches the caller")
     func validation() async {
         let bus: JSONValue = .object(["protocol": .string("i2c"), "sda": .int(1), "scl": .int(1)])

@@ -8,17 +8,19 @@ GENERATED := Sources/sal/Generated
 build:
 	swift build -c $(CONFIG)
 
+# SAL_NO_LAUNCH keeps a failing test from ever starting Logic 2.
 test:
-	swift test
+	SAL_NO_LAUNCH=1 swift test
 
 # End-to-end check against real hardware. Needs Logic 2 and the testgen board.
 verify:
 	swift build
 	SAL_LIVE=1 swift test --filter LiveTests
 
-# Injects bugs one at a time and requires the offline tests to catch each one.
+# Injects bugs one at a time and requires the offline tests to catch each one. Works in a
+# copy of the package, never in this tree. ARGS="Logic2App stalled" picks mutants.
 mutation:
-	python3 -I tools/mutation_test.py
+	python3 -I tools/mutation_test.py $(ARGS)
 
 # Region coverage of hand-written code, including the live tests.
 coverage:

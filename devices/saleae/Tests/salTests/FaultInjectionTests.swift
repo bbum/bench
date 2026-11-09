@@ -281,6 +281,40 @@ struct FaultInjectionTests {
         }
     }
 
+    @Test("A timed capture that never reports finishing is a hang, and still closes")
+    func timedWaitHangs() async {
+        let backend = FakeBackend(hanging: [.wait])
+        var timed = request
+        timed.mode = .timed(seconds: 0.05)
+        let started = ContinuousClock.now
+        await #expect(throws: Logic2Error.stalled) {
+            try await runCapture(timed, using: backend, cancellation: CaptureCancellation(), waitGraceSeconds: 0.1) { _ in
+                Issue.record("a capture that never finished was processed")
+            }
+        }
+        #expect(ContinuousClock.now - started >= .milliseconds(150))
+        #expect(await backend.closedIDs == [42])
+    }
+
+    @Test("A timed capture that finishes inside its grace period is left alone")
+    func timedWaitFinishes() async throws {
+        let backend = FakeBackend()
+        var timed = request
+        timed.mode = .timed(seconds: 0.05)
+        try await runCapture(timed, using: backend, cancellation: CaptureCancellation(), waitGraceSeconds: 0.1) { _ in }
+        #expect(await backend.calls == [.start, .wait, .close])
+    }
+
+    @Test("Cancelling a timed capture is still a cancellation, not a hang")
+    func timedWaitCancelled() async {
+        let cancellation = CaptureCancellation()
+        let backend = FakeBackend(hanging: [.wait], onEnter: { if $0 == .wait { cancellation.cancel() } })
+        await #expect(throws: CancellationError.self) {
+            try await runCapture(request, using: backend, cancellation: cancellation, waitGraceSeconds: 0.1) { _ in }
+        }
+        #expect(await backend.closedIDs == [42])
+    }
+
     @Test("An unreachable server fails promptly")
     func unreachableServer() async {
         await #expect(throws: (any Error).self) {
@@ -851,10 +885,15 @@ struct CaptureModeFlowTests {
 }
 
 private let uartRow = "\"a\",\"data\",1,0.5,,0x41\n"
-private let uartClean = "name,type,start_time,duration,\"error\",\"data\"\n" + String(repeating: uartRow, count: 3)
+private let uartHead = "name,type,start_time,duration,\"error\",\"data\"\n"
+private let uartBadRow = "\"a\",\"data\",1,0.5,\"framing\",0x41\n"
+/// Six rows: the first and last are dropped as the window's, which leaves the four that confirm.
+private let uartClean = uartHead + String(repeating: uartRow, count: 6)
 private let uartFraming = "name,type,start_time,duration,\"error\",\"data\"\n"
     + String(repeating: "\"a\",\"data\",1,0.5,\"framing\",0x41\n", count: 4)
-private let spiWords = "name,type,start_time,duration,\"mosi\"\n\"a\",\"result\",1,0.5,0xA5\n"
+private let spiHead = "name,type,start_time,duration,\"mosi\"\n"
+private let spiWord = "\"a\",\"result\",1,0.5,0xA5\n"
+private let spiWords = spiHead + String(repeating: spiWord, count: 4)
 private let i2cNack = "name,type,start_time,duration,\"address\",\"read\",\"ack\"\n\"a\",\"address\",1,0.5,0x42,false,false\n"
 private let emptyTable = "name,type,start_time,duration\n"
 
@@ -896,6 +935,10 @@ struct IdentifyConfirmationTests {
         let result = try await identify(backend)
         #expect(result.buses.map(\.confidence) == [.confirmed, .confirmed, .confirmed])
         #expect(result.buses.map(\.decoder.kind) == ["uart", "spi", "i2c"])
+        // Each says how much the decoder agreed with.
+        #expect(result.buses[0].evidence.hasSuffix(", 4 frames decoded cleanly"))
+        #expect(result.buses[1].evidence.hasSuffix(", 4 words decoded"))
+        #expect(result.buses[2].evidence.hasSuffix(", 1 address decoded"))
         #expect(await backend.closedIDs == [42])
         #expect(await backend.calls.filter { $0 == .analyzer }.count == 3)
     }
@@ -950,6 +993,41 @@ struct IdentifyConfirmationTests {
         #expect(result.buses[0].confidence == .confirmed)
     }
 
+    @Test("A stray bad frame does not veto the format that decodes the rest")
+    func strayFrameError() async throws {
+        let good = "\"a\",\"data\",1,0.5,,0x41\n"
+        let bad = "\"a\",\"data\",1,0.5,\"parity\",0x41\n"
+        let head = "name,type,start_time,duration,\"error\",\"data\"\n"
+        // After dropping the window's ends: 1 error in 40, against nothing that decodes at all otherwise.
+        let mostly = head + String(repeating: good, count: 20) + bad + String(repeating: good, count: 21)
+        let backend = FakeBackend(tableProvider: table { name, parity in
+            guard name == "Async Serial" else { return self.standardTables(name: name, parity: parity) }
+            return parity == "Even Parity Bit" ? mostly : uartFraming
+        })
+        let result = try await identify(backend)
+        guard case .uart(let uart) = result.buses[0].decoder else {
+            Issue.record("not uart")
+            return
+        }
+        #expect(uart.parity == .even)
+        #expect(result.buses[0].confidence == .confirmed)
+        #expect(result.buses[0].evidence.hasSuffix(", 40 frames decoded"))
+        #expect(result.buses[0].notes.last == "1 of 40 frames had errors.")
+    }
+
+    @Test("Just over the error allowance is not confirmed")
+    func tooManyFrameErrors() async throws {
+        let good = "\"a\",\"data\",1,0.5,,0x41\n"
+        let bad = "\"a\",\"data\",1,0.5,\"parity\",0x41\n"
+        let head = "name,type,start_time,duration,\"error\",\"data\"\n"
+        // After dropping the window's ends: 2 errors in 20 frames, above the 5% allowed.
+        let poor = head + String(repeating: good, count: 8) + bad + bad + String(repeating: good, count: 12)
+        let backend = FakeBackend(tableProvider: table { name, parity in
+            name == "Async Serial" ? poor : self.standardTables(name: name, parity: parity)
+        })
+        #expect(try await identify(backend).buses[0].confidence == .uncertain)
+    }
+
     @Test("Errors at every parity leave the bus uncertain, with a note")
     func noParityWorks() async throws {
         let backend = FakeBackend(tableProvider: table { name, parity in
@@ -957,22 +1035,93 @@ struct IdentifyConfirmationTests {
         })
         let result = try await identify(backend)
         #expect(result.buses[0].confidence == .uncertain)
-        #expect(result.buses[0].notes.last == "Decoding still reported 2 errors with each parity and polarity. Check the frame format.")
+        #expect(result.buses[0].notes.last == "Decoding still reported 2 errors at best. Check the frame format.")
         #expect(await backend.calls.filter { $0 == .analyzer }.count == 8)
     }
 
     @Test("A cut-off first and last frame do not count as errors")
     func windowEdges() async throws {
-        let cut = "name,type,start_time,duration,\"error\",\"data\"\n"
-            + "\"a\",\"data\",1,0.5,\"framing\",0x41\n" + uartRow + "\"a\",\"data\",1,0.5,\"framing\",0x41\n"
+        let cut = uartHead + uartBadRow + String(repeating: uartRow, count: 4) + uartBadRow
         let backend = FakeBackend(tableProvider: table { name, parity in
             name == "Async Serial" ? cut : self.standardTables(name: name, parity: parity)
         })
         #expect(try await identify(backend).buses[0].confidence == .confirmed)
     }
 
+    @Test("Clean frames short of four agree without confirming", arguments: [(3, 1, "frame"), (5, 3, "frames")])
+    func tooFewFrames(rows: Int, checked: Int, noun: String) async throws {
+        let thin = uartHead + String(repeating: uartRow, count: rows)
+        let backend = FakeBackend(tableProvider: table { name, parity in
+            name == "Async Serial" ? thin : self.standardTables(name: name, parity: parity)
+        })
+        let result = try await identify(backend)
+        // Timing alone made it likely, and that is where it stays.
+        #expect(result.buses[0].confidence == .likely)
+        #expect(result.buses[0].notes.last == "Only \(checked) \(noun) could be checked, too few to confirm.")
+        #expect(!result.buses[0].evidence.contains("decoded"))
+        // One decode was enough to learn that. The other parities would be no better founded.
+        #expect(await backend.calls.filter { $0 == .analyzer }.count == 3)
+    }
+
+    @Test("Rows the window may have spoiled confirm nothing, errors or not", arguments: [1, 2])
+    func nothingCheckable(rows: Int) async throws {
+        let spoiled = uartHead + String(repeating: uartBadRow, count: rows)
+        let backend = FakeBackend(tableProvider: table { name, parity in
+            name == "Async Serial" ? spoiled : self.standardTables(name: name, parity: parity)
+        })
+        let result = try await identify(backend)
+        #expect(result.buses[0].confidence == .likely)
+        #expect(result.buses[0].notes.last
+            == "Only \(rows) frame\(rows == 1 ? "" : "s") decoded, and none could be checked, too few to confirm.")
+    }
+
+    @Test("SPI the analyzer reports errors on is not confirmed")
+    func spiErrors() async throws {
+        let wrongPolarity = "name,type,start_time,duration\n" + String(repeating: "\"a\",\"error\",1,0.5\n", count: 7)
+        let backend = FakeBackend(tableProvider: table { name, parity in
+            name == "SPI" ? wrongPolarity : self.standardTables(name: name, parity: parity)
+        })
+        let result = try await identify(backend)
+        #expect(result.buses[1].confidence == .uncertain)
+        #expect(result.buses[1].notes.last == "Logic 2 reported 7 errors decoding it. Check the clock polarity.")
+    }
+
+    @Test("Errors beside decoded words still veto")
+    func spiErrorsWithWords() async throws {
+        let mixed = spiHead + String(repeating: spiWord, count: 8) + "\"a\",\"error\",1,0.5,\n"
+        let backend = FakeBackend(tableProvider: table { name, parity in
+            name == "SPI" ? mixed : self.standardTables(name: name, parity: parity)
+        })
+        let result = try await identify(backend)
+        #expect(result.buses[1].confidence == .uncertain)
+        #expect(result.buses[1].notes.last == "Logic 2 reported 1 error decoding it. Check the clock polarity.")
+    }
+
+    @Test("SPI words short of four agree without confirming", arguments: [(1, "word"), (3, "words")])
+    func tooFewWords(count: Int, noun: String) async throws {
+        let thin = spiHead + String(repeating: spiWord, count: count)
+        let backend = FakeBackend(tableProvider: table { name, parity in
+            name == "SPI" ? thin : self.standardTables(name: name, parity: parity)
+        })
+        let result = try await identify(backend)
+        #expect(result.buses[1].confidence == .likely)
+        #expect(result.buses[1].notes.last == "Only \(count) \(noun) decoded, too few to confirm.")
+    }
+
+    @Test("Several I2C addresses are counted in the plural")
+    func i2cAddresses() async throws {
+        let two = "name,type,start_time,duration,\"address\",\"read\",\"ack\"\n"
+            + String(repeating: "\"a\",\"address\",1,0.5,0x42,false,true\n", count: 2)
+        let backend = FakeBackend(tableProvider: table { name, parity in
+            name == "I2C" ? two : self.standardTables(name: name, parity: parity)
+        })
+        let result = try await identify(backend)
+        #expect(result.buses[2].evidence.hasSuffix(", 2 addresses decoded"))
+        #expect(!result.buses[2].notes.contains { $0.contains("NACK") })
+    }
+
     @Test("A decoder that finds nothing leaves the bus uncertain, with a note", arguments: [
-        ("Async Serial", 0, "Decoding still reported 0 errors with each parity and polarity. Check the frame format."),
+        ("Async Serial", 0, "Logic 2 decoded no frames."),
         ("SPI", 1, "Logic 2 decoded no SPI words."),
         ("I2C", 2, "Logic 2 decoded no I2C addresses."),
     ])

@@ -185,6 +185,16 @@ struct DecodePagingTests {
 
     private let rows = (0..<5).map { DecodedRow(type: "t\($0)", start: 0, duration: 0, fields: $0 == 4 ? ["error": "framing"] : [:]) }
 
+    @Test("An SPI row of type error is an issue, beside rows that carry an error field")
+    func errorRows() {
+        let rows = [
+            row("enable", [:]), row("result", ["mosi": "0xA5"]), row("error", [:]), row("disable", [:]), row("error", [:]),
+            row("data", ["error": "framing"]),
+        ]
+        #expect(decodeIssues(rows) == ["error": 2, "framing": 1])
+        #expect(decodeIssueLabels(rows) == [nil, nil, "error", nil, "error", "framing"])
+    }
+
     @Test("Pages slice the rows, and issues cover rows outside the page")
     func paging() {
         let page = decodePage(rows, offset: 1, limit: 2)

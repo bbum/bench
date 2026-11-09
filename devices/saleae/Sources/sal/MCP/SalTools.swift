@@ -90,13 +90,26 @@ func decodeCommandLine(_ arguments: JSONValue) throws -> [String] {
 }
 
 struct SalTools: ToolCatalog {
+    /// Where tools connect when a call does not say.
+    var endpoint = Logic2Endpoint()
+
+    /// Fills in the server's address for anything the call left out.
+    func withDefaultEndpoint(_ arguments: JSONValue) -> JSONValue {
+        guard case .object(var object) = arguments else { return arguments }
+        if object["host"] == nil { object["host"] = .string(endpoint.host) }
+        if object["port"] == nil { object["port"] = .int(endpoint.port) }
+        if !endpoint.launchIfNeeded { object["no_launch"] = .bool(true) }
+        return .object(object)
+    }
+
     func hasTool(named name: String) -> Bool {
         toolDefinitions.contains { $0["name"]?.stringValue == name }
     }
 
     var definitions: [JSONValue] { toolDefinitions }
 
-    func call(name: String, arguments: JSONValue) async throws -> String {
+    func call(name: String, arguments original: JSONValue) async throws -> String {
+        let arguments = withDefaultEndpoint(original)
         switch name {
         case "status": return try await callStatus(arguments)
         case "capture": return try await callCapture(arguments)
@@ -109,7 +122,7 @@ struct SalTools: ToolCatalog {
     }
 
     private func callStatus(_ arguments: JSONValue) async throws -> String {
-        let line = ["status"] + (try commandLine(from: arguments, allowed: ["host", "port"]))
+        let line = ["status"] + (try commandLine(from: arguments, allowed: ["host", "port", "no_launch"]))
         guard let command = try parsed(line) as? Status else { throw ToolInputError(description: "Bad status command.") }
         return try json(try await command.information())
     }
@@ -158,7 +171,7 @@ struct SalTools: ToolCatalog {
 }
 
 private let captureKeys: Set<String> = [
-    "host", "port", "rate", "duration", "level", "device", "manual", "trim", "buffer_mb", "glitch", "trigger",
+    "host", "port", "no_launch", "rate", "duration", "level", "device", "manual", "trim", "buffer_mb", "glitch", "trigger",
     "pulse_min", "pulse_max", "link", "trigger_timeout", "load", "save",
 ]
 
@@ -221,8 +234,8 @@ private let channel = bounded(0...15, "Channel index.")
 private let wordBitsField = bounded(wordBits.lowerBound...wordBits.upperBound, "Bits per word.")
 
 private let endpointFields: [String: JSONValue] = [
-    "host": field("string", "Logic 2 address. Default 127.0.0.1."),
-    "port": field("integer", "Logic 2 automation port. Default 10430."),
+    "host": field("string", "Logic 2 address. Defaults to the server's own setting."),
+    "port": field("integer", "Logic 2 automation port. Defaults to the server's own setting."),
 ]
 
 private let captureFields: [String: JSONValue] = endpointFields.merging([
