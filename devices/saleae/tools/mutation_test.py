@@ -23,6 +23,7 @@ DECODE = ROOT / "Subcommands/DecodeCommand.swift"
 MODE = ROOT / "Logic2/CaptureMode.swift"
 OPTIONS = ROOT / "Subcommands/CaptureOptions.swift"
 IDENTIFY = ROOT / "Analysis/ChannelIdentification.swift"
+ANALOG = ROOT / "Analysis/AnalogChannel.swift"
 
 MUTANTS = [
     (CHANNEL, "guard version == 0 else", "guard version >= 0 else"),
@@ -48,7 +49,22 @@ MUTANTS = [
     (SUMMARY, "periodMinSeconds: periods.min()!", "periodMinSeconds: periods.max()!"),
     (SUMMARY, "periodMaxSeconds: periods.max()!", "periodMaxSeconds: periods.min()!"),
     (CAPTURE, "        try? await backend.closeCapture(captureID)\n", ""),
-    (CAPTURE, "export.analogDownsampleRatio = 1", "export.analogDownsampleRatio = 2"),
+    (CAPTURE, "export.analogDownsampleRatio = request.analog?.downsample ?? 1", "export.analogDownsampleRatio = 2"),
+    (MODE, "device.analogSampleRate = analog?.sampleRate ?? 0", "device.analogSampleRate = 0"),
+    (OPTIONS, 'analog == nil ? "50M" : "6.25M"', '"50M"'),
+    (COMMAND, "(1...maximumAnalogDownsample).contains", "(0...maximumAnalogDownsample).contains"),
+    (ANALOG, "guard type == 1 else", "guard type >= 0 else"),
+    (ANALOG, "guard begin.isFinite else", "guard true else"),
+    (ANALOG, "downsample > 0, downsample <= rate else", "downsample > 0 else"),
+    (ANALOG, "guard count > 0, count <=", "guard count <="),
+    (ANALOG, "guard data.count == expected", "guard data.count >= expected"),
+    (ANALOG, "if !sample.isFinite { return index }", ""),
+    (ANALOG, "Double(rate) / Double(downsample)", "Double(rate)"),
+    (ANALOG, "guard swing >= minimumSwingVolts", "guard swing > 0"),
+    (ANALOG, "hysteresis: swing * 0.1", "hysteresis: 0"),
+    (ANALOG, "guard rises.count >= 4", "guard rises.count >= 3"),
+    (ANALOG, "abs($0 - median) <= median * 0.05", "abs($0 - median) <= median * 0.2"),
+    (ANALOG, "highAtLastRise - highAtFirstRise", "highAtLastRise"),
     (MODE, "device.digitalThresholdVolts = levelVolts", "device.digitalThresholdVolts = 1.8"),
     (MODE, "guard value.isFinite, value > 0 else", "guard value.isFinite else"),
     (MODE, "trigger.maximumPulse?.value ?? (", "trigger.minimumPulse?.value ?? ("),

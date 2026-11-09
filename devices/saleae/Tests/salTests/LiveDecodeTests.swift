@@ -8,6 +8,19 @@ private let uart = UARTDecoder(channel: 2, baud: 115_200)
 private let spi = SPIDecoder(clock: 3, mosi: 4, enable: 5)
 private let i2c = I2CDecoder(sda: 6, scl: 7)
 
+private func analogRequest(digital: [UInt32], digitalRate: UInt32 = 6_250_000) -> DigitalCaptureRequest {
+    DigitalCaptureRequest(
+        channels: digital, sampleRate: digitalRate, mode: .timed(seconds: 0.03), levelVolts: 3.3, deviceID: nil,
+        analog: AnalogCapture(channels: [0], sampleRate: 1_562_500))
+}
+
+private func verifyAnalogPWM(_ analog: AnalogSummary) {
+    #expect(abs((analog.levels?.lowVolts ?? 99) - 0) < 0.25, "\(analog)")
+    #expect(abs((analog.levels?.highVolts ?? 99) - 3.3) < 0.3, "\(analog)")
+    #expect(abs((analog.periodic?.frequencyHz ?? 0) - 1000) < 15, "\(analog)")
+    #expect(abs((analog.periodic?.dutyPercent ?? 0) - 25) < 3, "\(analog)")
+}
+
 private struct RandomUART: CustomStringConvertible {
     var baud: Int
     var parity: Parity
@@ -497,6 +510,60 @@ extension LiveTests {
             let rows = try await decode(.uart(serial), seconds: seconds)
             #expect(contains(rows.compactMap { word($0) }, truth.payload.map(UInt64.init)), "\(truth)")
         }
+    }
+
+    @Test("PWM on analog reads 0 V and 3.3 V at the expected duty")
+    func analogPWM() async throws {
+        let summary = try await runDigitalCapture(analogRequest(digital: []), endpoint: Logic2Endpoint())
+        let analog = try #require(summary.analog.first)
+        verifyAnalogPWM(analog)
+    }
+
+    @Test("Analog and digital on one channel agree with each other")
+    func analogAndDigital() async throws {
+        let summary = try await runDigitalCapture(
+            analogRequest(digital: [0, 1], digitalRate: 6_250_000), endpoint: Logic2Endpoint())
+        verifyAnalogPWM(try #require(summary.analog.first))
+        let digital = try #require(summary.channels[0].periodic)
+        #expect(abs(digital.frequencyHz - 1000) < 10)
+        #expect(abs(digital.dutyPercent - 25) < 1)
+        #expect(summary.channels[1].edges > 0)
+    }
+
+    @Test("Downsampling keeps the same answer with fewer samples")
+    func analogDownsample() async throws {
+        var capture = analogRequest(digital: [])
+        capture.analog?.downsample = 10
+        let summary = try await runDigitalCapture(capture, endpoint: Logic2Endpoint())
+        let analog = try #require(summary.analog.first)
+        #expect(analog.sampleRateHz == 156_250)
+        verifyAnalogPWM(analog)
+    }
+
+    @Test("Eight analog channels capture at once")
+    func analogEight() async throws {
+        var capture = analogRequest(digital: [])
+        capture.analog?.channels = Array(0...7)
+        let summary = try await runDigitalCapture(capture, endpoint: Logic2Endpoint())
+        #expect(summary.analog.map(\.channel) == Array(0...7))
+        verifyAnalogPWM(summary.analog[0])
+    }
+
+    @Test("A sample rate pairing Logic 2 refuses is reported")
+    func analogBadPairing() async {
+        let capture = analogRequest(digital: [0], digitalRate: 500_000_000)
+        await #expect(throws: (any Error).self) {
+            try await runDigitalCapture(capture, endpoint: Logic2Endpoint())
+        }
+    }
+
+    @Test("The capture command takes analog options", arguments: [
+        ["--channels", "none", "--analog", "0"],
+        ["--channels", "0-1", "--analog", "0", "--analog-downsample", "5", "--json"],
+    ])
+    func analogCommand(arguments: [String]) async throws {
+        let command = try CaptureCommand.parseAsRoot(arguments + ["--duration", "0.02"]) as! CaptureCommand
+        try await command.run()
     }
 
     @Test("The decode commands run in both output modes", arguments: [

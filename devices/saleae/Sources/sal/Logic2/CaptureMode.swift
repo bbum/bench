@@ -126,6 +126,7 @@ extension DigitalCaptureRequest {
         device.logicChannels = logicChannels
         device.digitalSampleRate = sampleRate
         device.digitalThresholdVolts = levelVolts
+        device.analogSampleRate = analog?.sampleRate ?? 0
         device.glitchFilters = glitchFilters.map { filter in
             var entry = Saleae_Automation_GlitchFilterEntry()
             entry.channelIndex = filter.channel

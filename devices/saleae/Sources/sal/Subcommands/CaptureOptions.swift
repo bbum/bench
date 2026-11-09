@@ -5,8 +5,8 @@ import Foundation
 struct CaptureOptions: ParsableArguments {
     @OptionGroup var logic2: Logic2Options
 
-    @Option(help: "Digital sample rate, such as 50M or 500000.")
-    var rate = "50M"
+    @Option(help: "Digital sample rate, such as 50M or 500000. Defaults to 50M, or 6.25M alongside analog.")
+    var rate: String?
 
     @Option(help: "Seconds to capture, 0.5 by default. With --trigger, seconds after it. With --manual, a limit.")
     var duration: Double?
@@ -80,7 +80,11 @@ struct CaptureOptions: ParsableArguments {
 
     /// Builds the request. Trigger and linked channels are captured too, because Logic 2
     /// can only watch channels that are enabled.
-    func request(channels: [UInt32], stop: CaptureCancellation) throws -> DigitalCaptureRequest {
+    func request(
+        channels: [UInt32],
+        analog: AnalogCapture? = nil,
+        stop: CaptureCancellation
+    ) throws -> DigitalCaptureRequest {
         let extra = link.map(\.channel) + [trigger?.channel].compactMap { $0 }
         let captured = Array(Set(channels + extra)).sorted()
         guard glitch.allSatisfy({ captured.contains($0.channel) }) else {
@@ -99,18 +103,19 @@ struct CaptureOptions: ParsableArguments {
             mode = .timed(seconds: duration ?? defaultDuration, trimSeconds: trim?.value ?? 0)
         }
         return DigitalCaptureRequest(
-            channels: captured, sampleRate: try parseSampleRate(rate), mode: mode, levelVolts: level,
-            deviceID: device, glitchFilters: glitch, bufferMegabytes: bufferMb)
+            channels: captured, sampleRate: try parseSampleRate(rate ?? (analog == nil ? "50M" : "6.25M")), mode: mode,
+            levelVolts: level, deviceID: device, glitchFilters: glitch, bufferMegabytes: bufferMb, analog: analog)
     }
 
     /// Runs `body` with the built request. Ctrl-C ends a manual capture and keeps its
     /// data, and cancels any other kind.
     func perform<Result: Sendable>(
         channels: [UInt32],
+        analog: AnalogCapture? = nil,
         body: @escaping @Sendable (DigitalCaptureRequest) async throws -> Result
     ) async throws -> Result {
         let stop = CaptureCancellation()
-        let built = try request(channels: channels, stop: stop)
+        let built = try request(channels: channels, analog: analog, stop: stop)
         if manual && duration == nil {
             FileHandle.standardError.write(Data("Capturing until Ctrl-C\n".utf8))
         }

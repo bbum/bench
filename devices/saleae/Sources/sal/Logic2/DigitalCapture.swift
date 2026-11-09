@@ -1,5 +1,13 @@
 import Foundation
 
+/// Analog channels to record alongside any digital ones.
+struct AnalogCapture: Sendable {
+    var channels: [UInt32]
+    var sampleRate: UInt32
+    /// Keeps one sample in this many when exporting. From 1 to 1,000,000.
+    var downsample: UInt64 = 1
+}
+
 struct DigitalCaptureRequest: Sendable {
     var channels: [UInt32]
     var sampleRate: UInt32
@@ -11,10 +19,12 @@ struct DigitalCaptureRequest: Sendable {
     var glitchFilters: [GlitchFilter] = []
     /// Logic 2's memory limit for the capture. When nil, its own default applies.
     var bufferMegabytes: UInt32?
+    var analog: AnalogCapture?
 
     var logicChannels: Saleae_Automation_LogicChannels {
         var logicChannels = Saleae_Automation_LogicChannels()
         logicChannels.digitalChannels = channels
+        logicChannels.analogChannels = analog?.channels ?? []
         return logicChannels
     }
 }
@@ -102,7 +112,8 @@ func summarizedCapture(
 ) async throws -> CaptureSummary {
     try await inTemporaryDirectory { directory in
         try await export(directory)
-        return try summarizeCapture(directory: directory, channels: request.channels)
+        return try summarizeCapture(
+            directory: directory, channels: request.channels, analogChannels: request.analog?.channels ?? [])
     }
 }
 
@@ -148,7 +159,7 @@ private func exportBinary(
     export.directory = directory.path
     export.logicChannels = request.logicChannels
     // The server requires this even for digital-only exports.
-    export.analogDownsampleRatio = 1
+    export.analogDownsampleRatio = request.analog?.downsample ?? 1
     try await backend.exportBinary(export)
 }
 

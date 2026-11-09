@@ -55,7 +55,7 @@ struct ArgumentTests {
     func defaults() throws {
         let command = try CaptureCommand.parse([])
         #expect(command.channels == "0-7")
-        #expect(command.capture.rate == "50M")
+        #expect(command.capture.rate == nil)
         #expect(command.capture.duration == nil)
         #expect(command.capture.level == 3.3)
         #expect(command.capture.device == nil)

@@ -3,6 +3,7 @@ import Foundation
 struct CaptureSummary: Codable, Sendable, Equatable {
     var durationSeconds: Double
     var channels: [ChannelSummary]
+    var analog: [AnalogSummary] = []
 }
 
 struct ChannelSummary: Codable, Sendable, Equatable {
@@ -26,7 +27,7 @@ struct ChannelSummary: Codable, Sendable, Equatable {
     var periodic: Periodic?
 }
 
-func summarizeCapture(directory: URL, channels: [UInt32]) throws -> CaptureSummary {
+func summarizeCapture(directory: URL, channels: [UInt32], analogChannels: [UInt32] = []) throws -> CaptureSummary {
     var duration = 0.0
     var summaries: [ChannelSummary] = []
     for channel in channels {
@@ -35,7 +36,12 @@ func summarizeCapture(directory: URL, channels: [UInt32]) throws -> CaptureSumma
         duration = max(duration, digital.endTime - digital.beginTime)
         summaries.append(summarize(digital, channel: channel))
     }
-    return CaptureSummary(durationSeconds: duration, channels: summaries)
+    let analog = try analogChannels.map { channel in
+        let samples = try AnalogChannel(contentsOf: directory.appendingPathComponent("analog_\(channel).bin"))
+        duration = max(duration, Double(samples.sampleCount) / samples.effectiveSampleRate)
+        return summarize(samples, channel: channel)
+    }
+    return CaptureSummary(durationSeconds: duration, channels: summaries, analog: analog)
 }
 
 func summarize(_ digital: DigitalChannel, channel: UInt32) -> ChannelSummary {

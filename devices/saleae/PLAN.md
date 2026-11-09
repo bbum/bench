@@ -31,11 +31,8 @@ it with Logic 2's decoders on the same capture. All 40,320 relabelings of the re
 channels are identified offline, `testgen`'s random mode checks UART blind, and a run
 with three pairs of probes physically swapped was identified correctly.
 
-## Phase 5: Analog
-
-Analog capture, and analog with digital on the same channels.
-
-- Proof: PWM on analog reads about 0 V and 3.3 V at the expected duty.
+Phase 5, analog: `sal capture --analog` records analog alone or with digital, on the same
+channels if wanted, and reports levels, frequency and duty.
 
 ## Phase 6: Files and remaining exports
 

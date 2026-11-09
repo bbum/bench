@@ -6,7 +6,7 @@ a CLI today and will grow an MCP server. First target is the Logic Pro 8.
 Status: `sal status`, `sal capture` (digital capture with a per-channel summary) and
 `sal decode uart|spi|i2c` (decoded rows with paging and issue counts) work, with timed,
 manual and trigger captures and glitch filters. `sal identify` works out what is on
-each channel. MCP is not built yet. See PLAN.md for the phases.
+each channel, and `sal capture --analog` records analog with levels and duty. MCP is not built yet. See PLAN.md for the phases.
 
 ## Build
 
@@ -80,6 +80,9 @@ Tested the way SQLite is. New parsing or analysis code ships with all of these:
 - UART pauses between frames can be any length, so only time away from idle has to be
   whole bits. A capture opening mid-frame misdecodes until the next gap longer than a
   frame, so confirmation ignores rows before that gap.
+- Mixed analog and digital captures accept only certain rate pairs, which vary with the
+  channel set. 6.25 MS/s digital with 1.5625 MS/s analog works for every set tried, so
+  it is the default. Logic 2's error lists the valid pairs.
 - Adding an analyzer takes almost a second, so live tests should not add many.
 - The deployment target is macOS 27.0 because the current toolchain rejects 27.2.
 - Binary exports: this Logic Pro 8 on Logic 2.4.48 produces format V0 (confirmed by

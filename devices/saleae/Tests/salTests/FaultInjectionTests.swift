@@ -471,6 +471,69 @@ struct DecodeFaultInjectionTests {
     }
 }
 
+@Suite("Analog capture flow")
+struct AnalogCaptureFlowTests {
+    private func copyAnalog(to directory: URL) throws {
+        try copyFixtures(to: directory)
+        try FileManager.default.copyItem(
+            at: fixtureDirectory.deletingLastPathComponent().appendingPathComponent("analog/pwm.bin"),
+            to: directory.appendingPathComponent("analog_0.bin"))
+    }
+
+    private var analogRequest: DigitalCaptureRequest {
+        var capture = request
+        capture.analog = AnalogCapture(channels: [0], sampleRate: 1_562_500, downsample: 10)
+        return capture
+    }
+
+    private func run(_ backend: FakeBackend) async throws -> CaptureSummary {
+        let capture = analogRequest
+        return try await summarizedCapture(capture) { directory in
+            try await exportDigitalCapture(capture, to: directory, using: backend, cancellation: CaptureCancellation())
+        }
+    }
+
+    @Test("Analog settings reach the start and export requests")
+    func requests() async throws {
+        let backend = FakeBackend(writeExport: { try self.copyAnalog(to: $0) })
+        _ = try await run(backend)
+        let start = try #require(await backend.startRequest)
+        #expect(start.logicDeviceConfiguration.logicChannels.analogChannels == [0])
+        #expect(start.logicDeviceConfiguration.logicChannels.digitalChannels == Array(0...7))
+        #expect(start.logicDeviceConfiguration.analogSampleRate == 1_562_500)
+        let export = try #require(await backend.exportRequest)
+        #expect(export.logicChannels.analogChannels == [0])
+        #expect(export.analogDownsampleRatio == 10)
+    }
+
+    @Test("A capture summary covers digital and analog channels")
+    func summary() async throws {
+        let backend = FakeBackend(writeExport: { try self.copyAnalog(to: $0) })
+        let summary = try await run(backend)
+        #expect(summary.channels.count == 8)
+        #expect(summary.analog.map(\.channel) == [0])
+    }
+
+    @Test("A missing analog file fails, and the capture closes")
+    func missing() async {
+        let backend = FakeBackend()
+        await #expect(throws: (any Error).self) { try await run(backend) }
+        #expect(await backend.closedIDs == [42])
+    }
+
+    @Test("Digital-only captures send no analog channels or rate")
+    func digitalOnly() async throws {
+        let backend = FakeBackend()
+        _ = try await summarizedCapture(request) { directory in
+            try await exportDigitalCapture(request, to: directory, using: backend, cancellation: CaptureCancellation())
+        }
+        let start = try #require(await backend.startRequest)
+        #expect(start.logicDeviceConfiguration.logicChannels.analogChannels.isEmpty)
+        #expect(start.logicDeviceConfiguration.analogSampleRate == 0)
+        #expect(await backend.exportRequest?.analogDownsampleRatio == 1)
+    }
+}
+
 private func captureRequest(_ mode: CaptureMode) -> DigitalCaptureRequest {
     DigitalCaptureRequest(channels: Array(0...7), sampleRate: 50_000_000, mode: mode, levelVolts: 3.3, deviceID: nil)
 }

@@ -9,15 +9,44 @@ struct CaptureCommand: AsyncParsableCommand {
 
     @OptionGroup var capture: CaptureOptions
 
-    @Option(help: "Digital channels, such as 0-7 or 0,2,4.")
+    @Option(help: "Digital channels, such as 0-7 or 0,2,4, or none with --analog.")
     var channels = "0-7"
+
+    @Option(help: "Analog channels to record too, such as 0 or 0-3.")
+    var analog: String?
+
+    @Option(help: "Analog sample rate, such as 1.5625M. Only some pairings with --rate are valid.")
+    var analogRate = "1.5625M"
+
+    @Option(help: "Keep one analog sample in this many, from 1 to 1,000,000.")
+    var analogDownsample: UInt64 = 1
 
     @Flag(help: "Print JSON instead of a table.")
     var json = false
 
+    func validate() throws {
+        guard (1...maximumAnalogDownsample).contains(analogDownsample) else {
+            throw ValidationError("--analog-downsample must be from 1 to \(maximumAnalogDownsample).")
+        }
+        guard channels != "none" || analog != nil else {
+            throw ValidationError("--channels none needs --analog.")
+        }
+    }
+
+    var analogCapture: AnalogCapture? {
+        get throws {
+            try analog.map {
+                AnalogCapture(
+                    channels: try parseChannelList($0), sampleRate: try parseSampleRate(analogRate),
+                    downsample: analogDownsample)
+            }
+        }
+    }
+
     func run() async throws {
         let endpoint = capture.logic2.endpoint
-        let summary = try await capture.perform(channels: try parseChannelList(channels)) { request in
+        let digital = channels == "none" ? [] : try parseChannelList(channels)
+        let summary = try await capture.perform(channels: digital, analog: try analogCapture) { request in
             try await runDigitalCapture(request, endpoint: endpoint)
         }
 
@@ -28,6 +57,7 @@ struct CaptureCommand: AsyncParsableCommand {
         } else {
             print("\(formatSeconds(summary.durationSeconds)) captured")
             summary.channels.forEach { print(describe($0)) }
+            summary.analog.forEach { print(describe($0)) }
         }
     }
 }
@@ -81,6 +111,22 @@ func parseSampleRate(_ text: String) throws -> UInt32 {
         throw ValidationError("Invalid sample rate: \(text)")
     }
     return rate
+}
+
+let maximumAnalogDownsample: UInt64 = 1_000_000
+
+func describe(_ summary: AnalogSummary) -> String {
+    var parts = ["A\(summary.channel)"]
+    if let levels = summary.levels {
+        parts.append(String(format: "low %.3f V, high %.3f V", levels.lowVolts, levels.highVolts))
+    } else {
+        parts.append(String(format: "steady %.3f V", summary.meanVolts))
+    }
+    if let periodic = summary.periodic {
+        parts.append(String(format: "%.2f Hz, %.2f%% duty", periodic.frequencyHz, periodic.dutyPercent))
+    }
+    parts.append(String(format: "range %.3f to %.3f V, rms %.3f V", summary.minVolts, summary.maxVolts, summary.rmsVolts))
+    return parts.joined(separator: ", ")
 }
 
 func describe(_ summary: ChannelSummary) -> String {
