@@ -1,0 +1,13 @@
+{
+  "version": "0.0.1",
+  "apiVersion": "1.0.0",
+  "author": "bench",
+  "name": "sal test extension",
+  "description": "High level analyzer used by the sal live tests.",
+  "extensions": {
+    "Byte Tagger": {
+      "type": "HighLevelAnalyzer",
+      "entryPoint": "HighLevelAnalyzer.ByteTagger"
+    }
+  }
+}

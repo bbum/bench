@@ -9,8 +9,8 @@ struct IdentifyCommand: AsyncParsableCommand {
 
     @OptionGroup var capture: CaptureOptions
 
-    @Option(help: "Digital channels, such as 0-7 or 0,2,4.")
-    var channels = "0-7"
+    @Option(help: "Digital channels, such as 0-7 or 0,2,4. Defaults to 0-7, or all with --load.")
+    var channels: String?
 
     @Flag(help: "Trust timing alone instead of confirming each bus with Logic 2's decoders.")
     var noConfirm = false
@@ -21,7 +21,8 @@ struct IdentifyCommand: AsyncParsableCommand {
     func run() async throws {
         let confirm = !noConfirm
         let endpoint = capture.logic2.endpoint
-        let identification = try await capture.perform(channels: try parseChannelList(channels)) { request in
+        let digital = try resolvedChannels(channels, loading: capture.load != nil)
+        let identification = try await capture.perform(channels: digital) { request in
             try await runIdentify(request, confirm: confirm, endpoint: endpoint)
         }
 

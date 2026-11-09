@@ -105,6 +105,8 @@ enum CaptureMode: Sendable {
     /// Runs until `stop` is cancelled or `limitSeconds` passes.
     case manual(limitSeconds: Double?, trimSeconds: Double = 0, stop: CaptureCancellation)
     case trigger(DigitalTrigger)
+    /// Opens a saved `.sal` file instead of capturing. The path must be absolute.
+    case load(path: String)
 }
 
 enum CaptureError: Error, Equatable, CustomStringConvertible {
@@ -140,6 +142,8 @@ extension DigitalCaptureRequest {
         start.captureConfiguration.bufferSizeMegabytes = bufferMegabytes ?? 0
 
         switch mode {
+        case .load:
+            break
         case .timed(let seconds, let trimSeconds):
             var timed = Saleae_Automation_TimedCaptureMode()
             timed.durationSeconds = seconds

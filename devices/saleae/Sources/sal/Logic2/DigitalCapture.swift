@@ -8,6 +8,12 @@ struct AnalogCapture: Sendable {
     var downsample: UInt64 = 1
 }
 
+/// Logic 2's own CSV of the raw samples, written to a directory it does not create.
+struct RawCSVExport: Sendable {
+    var directory: String
+    var iso8601: Bool
+}
+
 struct DigitalCaptureRequest: Sendable {
     var channels: [UInt32]
     var sampleRate: UInt32
@@ -20,6 +26,14 @@ struct DigitalCaptureRequest: Sendable {
     /// Logic 2's memory limit for the capture. When nil, its own default applies.
     var bufferMegabytes: UInt32?
     var analog: AnalogCapture?
+    /// Where to save a `.sal` file. Absolute, because Logic 2 resolves it in its own process.
+    var savePath: String?
+    var rawCSV: RawCSVExport?
+
+    /// A loaded capture exports every channel it has unless told otherwise.
+    var exportsEverything: Bool {
+        if case .load = mode, channels.isEmpty, analog == nil { true } else { false }
+    }
 
     var logicChannels: Saleae_Automation_LogicChannels {
         var logicChannels = Saleae_Automation_LogicChannels()
@@ -37,6 +51,11 @@ protocol CaptureBackend: Sendable {
     func exportBinary(_ request: Saleae_Automation_ExportRawDataBinaryRequest) async throws
     func addAnalyzer(_ request: Saleae_Automation_AddAnalyzerRequest) async throws -> UInt64
     func exportDataTable(_ request: Saleae_Automation_ExportDataTableCsvRequest) async throws
+    func addHighLevelAnalyzer(_ request: Saleae_Automation_AddHighLevelAnalyzerRequest) async throws -> UInt64
+    func exportRawCSV(_ request: Saleae_Automation_ExportRawDataCsvRequest) async throws
+    func exportLegacy(_ request: Saleae_Automation_LegacyExportAnalyzerRequest) async throws
+    func saveCapture(_ captureID: UInt64, to path: String) async throws
+    func loadCapture(_ path: String) async throws -> UInt64
     func closeCapture(_ captureID: UInt64) async throws
 }
 
@@ -69,6 +88,31 @@ struct GRPCCaptureBackend: CaptureBackend {
 
     func exportDataTable(_ request: Saleae_Automation_ExportDataTableCsvRequest) async throws {
         _ = try await manager.exportDataTableCsv(request)
+    }
+
+    func addHighLevelAnalyzer(_ request: Saleae_Automation_AddHighLevelAnalyzerRequest) async throws -> UInt64 {
+        try await manager.addHighLevelAnalyzer(request).analyzerID
+    }
+
+    func exportRawCSV(_ request: Saleae_Automation_ExportRawDataCsvRequest) async throws {
+        _ = try await manager.exportRawDataCsv(request)
+    }
+
+    func exportLegacy(_ request: Saleae_Automation_LegacyExportAnalyzerRequest) async throws {
+        _ = try await manager.legacyExportAnalyzer(request)
+    }
+
+    func saveCapture(_ captureID: UInt64, to path: String) async throws {
+        var save = Saleae_Automation_SaveCaptureRequest()
+        save.captureID = captureID
+        save.filepath = path
+        _ = try await manager.saveCapture(save)
+    }
+
+    func loadCapture(_ path: String) async throws -> UInt64 {
+        var load = Saleae_Automation_LoadCaptureRequest()
+        load.filepath = path
+        return try await manager.loadCapture(load).captureInfo.captureID
     }
 
     func closeCapture(_ captureID: UInt64) async throws {
@@ -112,8 +156,10 @@ func summarizedCapture(
 ) async throws -> CaptureSummary {
     try await inTemporaryDirectory { directory in
         try await export(directory)
-        return try summarizeCapture(
-            directory: directory, channels: request.channels, analogChannels: request.analog?.channels ?? [])
+        let (digital, analog) =
+            request.exportsEverything
+            ? try exportedChannels(in: directory) : (request.channels, request.analog?.channels ?? [])
+        return try summarizeCapture(directory: directory, channels: digital, analogChannels: analog)
     }
 }
 
@@ -157,7 +203,7 @@ private func exportBinary(
     var export = Saleae_Automation_ExportRawDataBinaryRequest()
     export.captureID = captureID
     export.directory = directory.path
-    export.logicChannels = request.logicChannels
+    if !request.exportsEverything { export.logicChannels = request.logicChannels }
     // The server requires this even for digital-only exports.
     export.analogDownsampleRatio = request.analog?.downsample ?? 1
     try await backend.exportBinary(export)
@@ -175,7 +221,8 @@ func exportIdentifiedCapture(
     var result: ChannelIdentification?
     try await runCapture(request, using: backend, cancellation: cancellation) { captureID in
         try await exportBinary(request, captureID: captureID, to: directory, using: backend)
-        var identification = identifyChannels(try loadChannels(directory: directory, channels: request.channels))
+        let digital = request.exportsEverything ? try exportedChannels(in: directory).digital : request.channels
+        var identification = identifyChannels(try loadChannels(directory: directory, channels: digital))
         if confirm {
             for index in identification.buses.indices {
                 try cancellation.checkCancelled()
@@ -290,9 +337,46 @@ func exportDecodedCapture(
     cancellation: CaptureCancellation
 ) async throws {
     try await runCapture(request.capture, using: backend, cancellation: cancellation) { captureID in
-        try await exportDataTable(
-            request.decoder, radix: request.radix, captureID: captureID, to: file, using: backend)
+        let analyzerID = try await addAnalyzer(request.decoder, captureID: captureID, using: backend)
+        var shownID = analyzerID
+        if let highLevel = request.highLevel {
+            var add = Saleae_Automation_AddHighLevelAnalyzerRequest()
+            add.captureID = captureID
+            add.extensionDirectory = highLevel.extensionDirectory
+            add.hlaName = highLevel.name
+            add.hlaLabel = highLevel.name
+            add.inputAnalyzerID = analyzerID
+            add.settings = Dictionary(uniqueKeysWithValues: highLevel.settings.map { ($0.key, $0.wireValue) })
+            shownID = try await backend.addHighLevelAnalyzer(add)
+        }
+        try await exportTable(shownID, radix: request.radix, captureID: captureID, to: file, using: backend)
+
+        if let table = request.tableExport {
+            try await exportTable(
+                shownID, radix: request.radix, captureID: captureID, to: URL(fileURLWithPath: table.path),
+                options: table, using: backend)
+        }
+        if let legacyPath = request.legacyPath {
+            var legacy = Saleae_Automation_LegacyExportAnalyzerRequest()
+            legacy.captureID = captureID
+            legacy.filepath = legacyPath
+            legacy.analyzerID = analyzerID
+            legacy.radixType = request.radix.type
+            try await backend.exportLegacy(legacy)
+        }
     }
+}
+
+/// Reads which channels a directory of binary exports holds.
+func exportedChannels(in directory: URL) throws -> (digital: [UInt32], analog: [UInt32]) {
+    let names = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+    func numbers(_ prefix: String) -> [UInt32] {
+        names.compactMap { name -> UInt32? in
+            guard name.hasPrefix(prefix), name.hasSuffix(".bin") else { return nil }
+            return UInt32(name.dropFirst(prefix.count).dropLast(4))
+        }.sorted()
+    }
+    return (numbers("digital_"), numbers("analog_"))
 }
 
 private func exportDataTable(
@@ -302,13 +386,31 @@ private func exportDataTable(
     to file: URL,
     using backend: some CaptureBackend
 ) async throws {
+    let analyzerID = try await addAnalyzer(decoder, captureID: captureID, using: backend)
+    try await exportTable(analyzerID, radix: radix, captureID: captureID, to: file, using: backend)
+}
+
+private func addAnalyzer(
+    _ decoder: ProtocolDecoder,
+    captureID: UInt64,
+    using backend: some CaptureBackend
+) async throws -> UInt64 {
     var add = Saleae_Automation_AddAnalyzerRequest()
     add.captureID = captureID
     add.analyzerName = decoder.analyzerName
     add.analyzerLabel = decoder.analyzerName
     add.settings = decoder.settings
-    let analyzerID = try await backend.addAnalyzer(add)
+    return try await backend.addAnalyzer(add)
+}
 
+private func exportTable(
+    _ analyzerID: UInt64,
+    radix: Radix,
+    captureID: UInt64,
+    to file: URL,
+    options: TableExport? = nil,
+    using backend: some CaptureBackend
+) async throws {
     var analyzer = Saleae_Automation_DataTableAnalyzerConfiguration()
     analyzer.analyzerID = analyzerID
     analyzer.radixType = radix.type
@@ -317,6 +419,14 @@ private func exportDataTable(
     export.captureID = captureID
     export.filepath = file.path
     export.analyzers = [analyzer]
+    if let options {
+        export.iso8601Timestamp = options.iso8601
+        export.exportColumns = options.columns
+        if let query = options.filterQuery {
+            export.filter.query = query
+            export.filter.columns = options.filterColumns
+        }
+    }
     try await backend.exportDataTable(export)
 }
 
@@ -332,10 +442,17 @@ func runCapture(
     process: (UInt64) async throws -> Void
 ) async throws {
     try cancellation.checkCancelled()
-    let captureID = try await backend.startCapture(request.startRequest)
+    let captureID: UInt64
+    if case .load(let path) = request.mode {
+        captureID = try await backend.loadCapture(path)
+    } else {
+        captureID = try await backend.startCapture(request.startRequest)
+    }
 
     do {
         switch request.mode {
+        case .load:
+            break
         case .timed:
             try await cancellation.interruptible { try await backend.waitCapture(captureID) }
         case .manual(let limitSeconds, _, let stop):
@@ -343,6 +460,16 @@ func runCapture(
             try await backend.stopCapture(captureID)
         case .trigger(let trigger):
             try await waitForTrigger(trigger, captureID: captureID, using: backend, cancellation: cancellation)
+        }
+        if let savePath = request.savePath { try await backend.saveCapture(captureID, to: savePath) }
+        if let rawCSV = request.rawCSV {
+            var export = Saleae_Automation_ExportRawDataCsvRequest()
+            export.captureID = captureID
+            export.directory = rawCSV.directory
+            if !request.exportsEverything { export.logicChannels = request.logicChannels }
+            export.analogDownsampleRatio = request.analog?.downsample ?? 1
+            export.iso8601Timestamp = rawCSV.iso8601
+            try await backend.exportRawCSV(export)
         }
         try await process(captureID)
         try cancellation.checkCancelled()

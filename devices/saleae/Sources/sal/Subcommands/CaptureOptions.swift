@@ -44,7 +44,24 @@ struct CaptureOptions: ParsableArguments {
     @Option(help: "Seconds to wait for the trigger.")
     var triggerTimeout = 10.0
 
+    @Option(help: "Use a saved .sal file instead of capturing.")
+    var load: String?
+
+    @Option(help: "Save the capture to this .sal file.")
+    var save: String?
+
+    /// Paths are made absolute here, because Logic 2 runs in its own working directory.
+    var loadPath: String? { load.map(absolutePath) }
+
     func validate() throws {
+        if load != nil {
+            let capturing =
+                rate != nil || duration != nil || device != nil || manual || trim != nil || bufferMb != nil
+                || !glitch.isEmpty || trigger != nil
+            guard !capturing else {
+                throw ValidationError("--load uses a saved capture, so it cannot take capture settings.")
+            }
+        }
         if let duration {
             guard duration.isFinite, duration > 0 else {
                 throw ValidationError("Duration must be a positive number of seconds.")
@@ -92,7 +109,9 @@ struct CaptureOptions: ParsableArguments {
         }
 
         let mode: CaptureMode
-        if manual {
+        if let loadPath {
+            mode = .load(path: loadPath)
+        } else if manual {
             mode = .manual(limitSeconds: duration, trimSeconds: trim?.value ?? 0, stop: stop)
         } else if let trigger {
             mode = .trigger(
@@ -104,7 +123,8 @@ struct CaptureOptions: ParsableArguments {
         }
         return DigitalCaptureRequest(
             channels: captured, sampleRate: try parseSampleRate(rate ?? (analog == nil ? "50M" : "6.25M")), mode: mode,
-            levelVolts: level, deviceID: device, glitchFilters: glitch, bufferMegabytes: bufferMb, analog: analog)
+            levelVolts: level, deviceID: device, glitchFilters: glitch, bufferMegabytes: bufferMb, analog: analog,
+            savePath: save.map(absolutePath))
     }
 
     /// Runs `body` with the built request. Ctrl-C ends a manual capture and keeps its
@@ -127,3 +147,16 @@ struct CaptureOptions: ParsableArguments {
 }
 
 private let defaultDuration = 0.5
+
+func absolutePath(_ path: String) -> String {
+    URL(fileURLWithPath: path).standardizedFileURL.path
+}
+
+/// The channel list to use. A loaded file without one exports whatever it holds.
+func resolvedChannels(_ text: String?, loading: Bool) throws -> [UInt32] {
+    switch text {
+    case "none": []
+    case let text?: try parseChannelList(text)
+    case nil: loading ? [] : try parseChannelList("0-7")
+    }
+}

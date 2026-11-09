@@ -6,7 +6,8 @@ a CLI today and will grow an MCP server. First target is the Logic Pro 8.
 Status: `sal status`, `sal capture` (digital capture with a per-channel summary) and
 `sal decode uart|spi|i2c` (decoded rows with paging and issue counts) work, with timed,
 manual and trigger captures and glitch filters. `sal identify` works out what is on
-each channel, and `sal capture --analog` records analog with levels and duty. MCP is not built yet. See PLAN.md for the phases.
+each channel, and `sal capture --analog` records analog with levels and duty. Every
+capturing command can `--save` to and `--load` from a `.sal` file. MCP is not built yet. See PLAN.md for the phases.
 
 ## Build
 
@@ -83,6 +84,10 @@ Tested the way SQLite is. New parsing or analysis code ships with all of these:
 - Mixed analog and digital captures accept only certain rate pairs, which vary with the
   channel set. 6.25 MS/s digital with 1.5625 MS/s analog works for every set tried, so
   it is the default. Logic 2's error lists the valid pairs.
+- Logic 2 is a separate process, so paths sent to it must be absolute. It does not
+  create directories for raw CSV exports.
+- A loaded capture has no channel list, so `sal` exports without one and reads which
+  channels exist from the file names. Naming a channel the file lacks is an error.
 - Adding an analyzer takes almost a second, so live tests should not add many.
 - The deployment target is macOS 27.0 because the current toolchain rejects 27.2.
 - Binary exports: this Logic Pro 8 on Logic 2.4.48 produces format V0 (confirmed by
@@ -92,4 +97,5 @@ Tested the way SQLite is. New parsing or analysis code ships with all of these:
   expected values for each channel, and the modes selected over USB serial. Opening
   the port usually resets the board and closing it does not, so tests select a mode
   and restore clean mode.
+- `testgen/hla/` is a small high level analyzer that the live tests run through Logic 2.
 - `proto/` is a verbatim copy of upstream. See `proto/UPSTREAM`.

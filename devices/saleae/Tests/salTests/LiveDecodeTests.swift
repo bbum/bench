@@ -21,6 +21,26 @@ private func verifyAnalogPWM(_ analog: AnalogSummary) {
     #expect(abs((analog.periodic?.dutyPercent ?? 0) - 25) < 3, "\(analog)")
 }
 
+private let testExtensionDirectory = URL(fileURLWithPath: #filePath)
+    .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+    .appendingPathComponent("testgen/hla").path
+
+private func loadRequest(_ path: String) -> DigitalCaptureRequest {
+    DigitalCaptureRequest(channels: [], sampleRate: 1, mode: .load(path: path), levelVolts: 3.3, deviceID: nil)
+}
+
+private func analogFreeCapture(channels: [UInt32]) -> DigitalCaptureRequest {
+    DigitalCaptureRequest(channels: channels, sampleRate: 50_000_000, mode: .timed(seconds: 0.12), levelVolts: 3.3, deviceID: nil)
+}
+
+/// A real directory for Logic 2 to write to. Its own process cannot see a sandboxed one.
+private func inScratch<Result>(_ body: (URL) async throws -> Result) async throws -> Result {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("sal-live-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    return try await body(directory)
+}
+
 private struct RandomUART: CustomStringConvertible {
     var baud: Int
     var parity: Parity
@@ -564,6 +584,214 @@ extension LiveTests {
     func analogCommand(arguments: [String]) async throws {
         let command = try CaptureCommand.parseAsRoot(arguments + ["--duration", "0.02"]) as! CaptureCommand
         try await command.run()
+    }
+
+    @Test("Saving and reloading gives an identical summary")
+    func saveAndReload() async throws {
+        try await inScratch { directory in
+            var original = analogRequest(digital: Array(0...7))
+            original.savePath = directory.appendingPathComponent("saved.sal").path
+            let first = try await runDigitalCapture(original, endpoint: Logic2Endpoint())
+
+            let again = try await runDigitalCapture(loadRequest(original.savePath!), endpoint: Logic2Endpoint())
+            #expect(again == first)
+            #expect(again.channels.map(\.channel) == Array(0...7))
+            #expect(again.analog.map(\.channel) == [0])
+        }
+    }
+
+    @Test("A saved capture decodes and identifies like a live one")
+    func decodeAndIdentifySaved() async throws {
+        try await withTestgen(mode: "c") {
+            try await inScratch { directory in
+                let file = directory.appendingPathComponent("saved.sal").path
+                var capture = DigitalCaptureRequest(
+                    channels: Array(0...7), sampleRate: 50_000_000, mode: .timed(seconds: 0.2), levelVolts: 3.3, deviceID: nil)
+                capture.savePath = file
+                _ = try await runDigitalCapture(capture, endpoint: Logic2Endpoint())
+
+                let rows = try await runDecode(
+                    DecodeRequest(capture: loadRequest(file), decoder: .uart(uart)), endpoint: Logic2Endpoint())
+                #expect(contains(rows.compactMap { word($0) }, message))
+
+                let result = try await runIdentify(loadRequest(file), confirm: true, endpoint: Logic2Endpoint())
+                #expect(result.buses.map(\.decoder) == [
+                    .uart(uart), .spi(SPIDecoder(clock: 3, mosi: 4, enable: 5)), .i2c(i2c),
+                ])
+            }
+        }
+    }
+
+    @Test("A missing file is reported")
+    func loadMissing() async {
+        await #expect(throws: (any Error).self) {
+            try await runDigitalCapture(loadRequest("/nonexistent/none.sal"), endpoint: Logic2Endpoint())
+        }
+    }
+
+    @Test("Logic 2's own CSV agrees with the binary parser, digital and analog")
+    func csvOracle() async throws {
+        try await inScratch { directory in
+            var capture = DigitalCaptureRequest(
+                channels: Array(0...7), sampleRate: 6_250_000, mode: .timed(seconds: 0.05), levelVolts: 3.3, deviceID: nil,
+                analog: AnalogCapture(channels: [0, 1], sampleRate: 1_562_500, downsample: 100))
+            let csvDirectory = directory.appendingPathComponent("csv")
+            try FileManager.default.createDirectory(at: csvDirectory, withIntermediateDirectories: true)
+            capture.rawCSV = RawCSVExport(directory: csvDirectory.path, iso8601: false)
+
+            let binary = directory.appendingPathComponent("binary")
+            try FileManager.default.createDirectory(at: binary, withIntermediateDirectories: true)
+            try await withLogic2(Logic2Endpoint()) { manager in
+                try await exportDigitalCapture(
+                    capture, to: binary, using: GRPCCaptureBackend(manager: manager), cancellation: CaptureCancellation())
+            }
+
+            let table = try parseCSV(Data(contentsOf: csvDirectory.appendingPathComponent("digital.csv")))
+            let channels = try loadChannels(directory: binary, channels: Array(0...7))
+            #expect(table[0] == ["Time [s]"] + (0...7).map { "Channel \($0)" })
+            for column in 1...8 {
+                var previous = table[1][column]
+                var edges: [Double] = []
+                for row in table.dropFirst(2) where row[column] != previous {
+                    edges.append(Double(row[0])!)
+                    previous = row[column]
+                }
+                let parsed = channels[column - 1]
+                #expect(edges.count == parsed.times.count, "channel \(column - 1)")
+                #expect(zip(edges, parsed.times).allSatisfy { abs($0 - $1) < 2e-9 }, "channel \(column - 1)")
+                #expect(Int(table[1][column]) == parsed.summary.initialLevel, "channel \(column - 1)")
+            }
+
+            let analogTable = try parseCSV(Data(contentsOf: csvDirectory.appendingPathComponent("analog.csv")))
+            #expect(analogTable[0] == ["Time [s]", "Channel 0", "Channel 1"])
+            for (column, channel) in [UInt32(0), 1].enumerated() {
+                let parsed = try AnalogChannel(contentsOf: binary.appendingPathComponent("analog_\(channel).bin"))
+                #expect(analogTable.count - 1 == parsed.sampleCount)
+                parsed.withSamples { samples in
+                    for index in 0..<samples.count {
+                        let text = analogTable[index + 1][column + 1]
+                        #expect(abs(Double(text)! - samples[index]) < 0.001, "channel \(channel) sample \(index)")
+                    }
+                }
+            }
+        }
+    }
+
+    @Test("Table exports honor time format, columns and filter")
+    func tableExports() async throws {
+        try await withTestgen(mode: "c") {
+            try await inScratch { directory in
+                func export(_ edit: (inout TableExport) -> Void) async throws -> [[String]] {
+                    let file = directory.appendingPathComponent("t-\(UUID().uuidString).csv")
+                    var table = TableExport(path: file.path)
+                    edit(&table)
+                    var request = DecodeRequest(capture: analogFreeCapture(channels: [2]), decoder: .uart(uart))
+                    request.tableExport = table
+                    _ = try await runDecode(request, endpoint: Logic2Endpoint())
+                    return try parseCSV(Data(contentsOf: file))
+                }
+
+                let iso = try await export { $0.iso8601 = true }
+                #expect(iso[1][2].contains("T") && iso[1][2].hasSuffix("+00:00"))
+
+                let columns = try await export { $0.columns = ["data"] }
+                #expect(columns[0] == ["name", "data"])
+                #expect(columns.dropFirst().allSatisfy { $0.count == 2 })
+
+                let filtered = try await export {
+                    $0.filterQuery = "0x54"
+                    $0.filterColumns = ["data"]
+                }
+                #expect(filtered.count > 1)
+                #expect(filtered.dropFirst().allSatisfy { $0.last == "0x54" })
+            }
+        }
+    }
+
+    @Test("A legacy export holds the decoded bytes")
+    func legacyExport() async throws {
+        try await withTestgen(mode: "c") {
+            try await inScratch { directory in
+                let file = directory.appendingPathComponent("legacy.txt")
+                var request = DecodeRequest(capture: analogFreeCapture(channels: [2]), decoder: .uart(uart))
+                request.legacyPath = file.path
+                _ = try await runDecode(request, endpoint: Logic2Endpoint())
+                let table = try parseCSV(Data(contentsOf: file))
+                #expect(table[0][0..<2] == ["Time [s]", "Value"])
+                let values = table.dropFirst().compactMap { UInt64($0[1].dropFirst(2), radix: 16) }
+                #expect(contains(values, message))
+            }
+        }
+    }
+
+    @Test("A high level analyzer's settings and rows come through")
+    func highLevelAnalyzer() async throws {
+        try await withTestgen(mode: "c") {
+            var request = DecodeRequest(capture: analogFreeCapture(channels: [2]), decoder: .uart(uart))
+            request.highLevel = HighLevelRequest(
+                extensionDirectory: testExtensionDirectory, name: "Byte Tagger",
+                settings: [
+                    HighLevelSetting(key: "prefix", value: .text(">")),
+                    HighLevelSetting(key: "scale", value: .number(2)),
+                    HighLevelSetting(key: "case", value: .text("lower")),
+                ])
+            let rows = try await runDecode(request, endpoint: Logic2Endpoint())
+            #expect(rows.allSatisfy { $0.type == "tagged" })
+            let tags = rows.compactMap { $0.fields["text"] }
+            #expect(contains(tags, ">testgen uart\n".dropFirst().map { ">\($0)" }))
+            let scaled = rows.first { $0.fields["text"] == ">t" }?.fields["scaled"]
+            #expect(scaled == "168")
+        }
+    }
+
+    @Test("A bad high level analyzer is reported, and the next capture is clean", arguments: [
+        ("Byte Tagger", "nonsense"), ("No Such Analyzer", "keep"),
+    ])
+    func highLevelErrors(name: String, choice: String) async throws {
+        var request = DecodeRequest(capture: analogFreeCapture(channels: [2]), decoder: .uart(uart))
+        request.highLevel = HighLevelRequest(
+            extensionDirectory: testExtensionDirectory, name: name,
+            settings: [
+                HighLevelSetting(key: "prefix", value: .text("")),
+                HighLevelSetting(key: "scale", value: .number(1)),
+                HighLevelSetting(key: "case", value: .text(choice)),
+            ])
+        let attempt = request
+        await #expect(throws: (any Error).self) { try await runDecode(attempt, endpoint: Logic2Endpoint()) }
+        _ = try await runDecode(
+            DecodeRequest(capture: analogFreeCapture(channels: [2]), decoder: .uart(uart)), endpoint: Logic2Endpoint())
+    }
+
+    @Test("The commands take file options")
+    func fileCommands() async throws {
+        try await inScratch { directory in
+            let saved = directory.appendingPathComponent("c.sal").path
+            let csv = directory.appendingPathComponent("csv")
+            try FileManager.default.createDirectory(at: csv, withIntermediateDirectories: true)
+
+            let capture = try CaptureCommand.parseAsRoot([
+                "--channels", "0-2", "--duration", "0.05", "--save", saved, "--export-csv", csv.path, "--iso8601",
+            ]) as! CaptureCommand
+            try await capture.run()
+            #expect(FileManager.default.fileExists(atPath: csv.appendingPathComponent("digital.csv").path))
+
+            let load = try CaptureCommand.parseAsRoot(["--load", saved]) as! CaptureCommand
+            try await load.run()
+
+            let identify = try IdentifyCommand.parseAsRoot(["--load", saved, "--no-confirm"]) as! IdentifyCommand
+            try await identify.run()
+
+            let table = directory.appendingPathComponent("t.csv").path
+            let legacy = directory.appendingPathComponent("l.txt").path
+            let decode = try UARTCommand.parseAsRoot([
+                "--channel", "2", "--baud", "115200", "--load", saved, "--export-table", table, "--export-legacy", legacy,
+                "--hla", "Byte Tagger", "--hla-extension", testExtensionDirectory, "--hla-setting", "prefix=x",
+                "--hla-setting", "scale=1", "--hla-setting", "case=keep", "--limit", "2",
+            ]) as! UARTCommand
+            try await decode.run()
+            #expect(FileManager.default.fileExists(atPath: table))
+            #expect(FileManager.default.fileExists(atPath: legacy))
+        }
     }
 
     @Test("The decode commands run in both output modes", arguments: [

@@ -13,7 +13,7 @@ runs on demand rather than every phase.
 ## Done
 
 Foundation: gRPC client, `sal status`, `sal capture` with per-channel summaries, binary
-export parser, the `testgen` board, and the test layers. Uses 9 of the 16 RPCs.
+export parser, the `testgen` board, and the test layers.
 
 Phase 1, cancellation: Ctrl-C, SIGTERM or task cancellation stops and closes the capture
 and removes temp files.
@@ -34,12 +34,10 @@ with three pairs of probes physically swapped was identified correctly.
 Phase 5, analog: `sal capture --analog` records analog alone or with digital, on the same
 channels if wanted, and reports levels, frequency and duty.
 
-## Phase 6: Files and remaining exports
-
-Save and load `.sal` files, CSV, data table and legacy exports, and high-level analyzers.
-
-- Proof: save and reload gives an identical summary. Logic 2's own CSV acts as a second
-  oracle for the binary parser.
+Phase 6, files and exports: `--save` and `--load` on every capturing command, raw CSV,
+data table and legacy exports, and high level analyzers. Saving and reloading gives an
+identical summary, and Logic 2's own CSV matches the binary parser. Uses 14 of the 16
+RPCs. The two left remove an analyzer, which a capture that closes when done never needs.
 
 ## Phase 7: MCP server
 

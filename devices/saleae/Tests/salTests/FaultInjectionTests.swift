@@ -3,7 +3,11 @@ import Synchronization
 import Testing
 @testable import sal
 
-private enum Step: CaseIterable, Sendable { case start, stop, wait, export, analyzer, table, close }
+private enum Step: CaseIterable, Sendable { case start, stop, wait, export, analyzer, table, close, highLevel, rawCSV, legacy, save, load
+
+    /// The steps of a plain capture, so that combination tests stay quick.
+    static let core: [Step] = [.start, .stop, .wait, .export, .analyzer, .table, .close]
+}
 private struct InjectedFault: Error, Equatable {}
 
 private actor FakeBackend: CaptureBackend {
@@ -19,6 +23,12 @@ private actor FakeBackend: CaptureBackend {
     private(set) var exportRequest: Saleae_Automation_ExportRawDataBinaryRequest?
     private(set) var analyzerRequest: Saleae_Automation_AddAnalyzerRequest?
     private(set) var tableRequest: Saleae_Automation_ExportDataTableCsvRequest?
+    private(set) var tableRequests: [Saleae_Automation_ExportDataTableCsvRequest] = []
+    private(set) var highLevelRequest: Saleae_Automation_AddHighLevelAnalyzerRequest?
+    private(set) var rawCSVRequest: Saleae_Automation_ExportRawDataCsvRequest?
+    private(set) var legacyRequest: Saleae_Automation_LegacyExportAnalyzerRequest?
+    private(set) var savedPath: String?
+    private(set) var loadedPath: String?
     var tableBytes = Data("name,type,start_time,duration,\"data\"\n\"a\",\"data\",1,0.5,0x41\n".utf8)
 
     init(
@@ -70,9 +80,37 @@ private actor FakeBackend: CaptureBackend {
 
     func exportDataTable(_ request: Saleae_Automation_ExportDataTableCsvRequest) async throws {
         tableRequest = request
+        tableRequests.append(request)
         try await record(.table)
         let bytes = analyzerRequest.flatMap { tableProvider?($0) } ?? tableBytes
         try bytes.write(to: URL(fileURLWithPath: request.filepath))
+    }
+
+    func addHighLevelAnalyzer(_ request: Saleae_Automation_AddHighLevelAnalyzerRequest) async throws -> UInt64 {
+        highLevelRequest = request
+        try await record(.highLevel)
+        return 9
+    }
+
+    func exportRawCSV(_ request: Saleae_Automation_ExportRawDataCsvRequest) async throws {
+        rawCSVRequest = request
+        try await record(.rawCSV)
+    }
+
+    func exportLegacy(_ request: Saleae_Automation_LegacyExportAnalyzerRequest) async throws {
+        legacyRequest = request
+        try await record(.legacy)
+    }
+
+    func saveCapture(_ captureID: UInt64, to path: String) async throws {
+        savedPath = path
+        try await record(.save)
+    }
+
+    func loadCapture(_ path: String) async throws -> UInt64 {
+        loadedPath = path
+        try await record(.load)
+        return 77
     }
 
     func setTable(_ bytes: Data) {
@@ -194,7 +232,7 @@ struct FaultInjectionTests {
 
     @Test("Every combination of failing steps closes at most once and cleans up")
     func everyCombination() async throws {
-        let steps = Step.allCases
+        let steps = Step.core
         for mask in 0..<(1 << steps.count) {
             let failing = Set(steps.indices.filter { mask & (1 << $0) != 0 }.map { steps[$0] })
             let backend = FakeBackend(failing: failing)
@@ -441,7 +479,7 @@ struct DecodeFaultInjectionTests {
 
     @Test("Every combination of failing steps closes at most once")
     func everyCombination() async {
-        let steps = Step.allCases
+        let steps = Step.core
         for mask in 0..<(1 << steps.count) {
             let failing = Set(steps.indices.filter { mask & (1 << $0) != 0 }.map { steps[$0] })
             let backend = FakeBackend(failing: failing)
@@ -660,7 +698,7 @@ struct CaptureModeFlowTests {
 
     @Test("Every failing step in every mode closes at most once")
     func everyCombination() async {
-        let steps = Step.allCases
+        let steps = Step.core
         for mask in 0..<(1 << steps.count) {
             let failing = Set(steps.indices.filter { mask & (1 << $0) != 0 }.map { steps[$0] })
             for mode: CaptureMode in [.manual(limitSeconds: 0, stop: CaptureCancellation()), .trigger(trigger)] {
@@ -822,6 +860,207 @@ struct IdentifyConfirmationTests {
         await #expect(throws: CancellationError.self) { try await identify(backend, cancellation: cancellation) }
         #expect(await backend.calls.filter { $0 == .analyzer }.count == 1)
         #expect(await backend.closedIDs == [42])
+    }
+}
+
+private let loadRequest = DigitalCaptureRequest(
+    channels: [], sampleRate: 1, mode: .load(path: "/saved.sal"), levelVolts: 3.3, deviceID: nil)
+
+@Suite("Saved captures and exports")
+struct FilesFlowTests {
+    private func capture(
+        _ backend: FakeBackend,
+        _ capture: DigitalCaptureRequest
+    ) async throws -> CaptureSummary {
+        try await summarizedCapture(capture) { directory in
+            try await exportDigitalCapture(capture, to: directory, using: backend, cancellation: CaptureCancellation())
+        }
+    }
+
+    private var uartDecode: DecodeRequest { decodeRequest }
+
+    private func decode(_ backend: FakeBackend, _ request: DecodeRequest) async throws -> [DecodedRow] {
+        try await decodedCapture { file in
+            try await exportDecodedCapture(request, to: file, using: backend, cancellation: CaptureCancellation())
+        }
+    }
+
+    @Test("Loading never starts or waits, exports every channel, and closes")
+    func load() async throws {
+        let backend = FakeBackend()
+        let summary = try await capture(backend, loadRequest)
+        #expect(summary.channels.map(\.channel) == Array(0...7))
+        #expect(await backend.calls == [.load, .export, .close])
+        #expect(await backend.loadedPath == "/saved.sal")
+        #expect(await backend.closedIDs == [77])
+        #expect(await backend.exportRequest?.channels == nil)
+    }
+
+    @Test("Loading with named channels exports only those")
+    func loadNamed() async throws {
+        var named = loadRequest
+        named.channels = Array(0...7)
+        let backend = FakeBackend()
+        _ = try await capture(backend, named)
+        #expect(await backend.exportRequest?.logicChannels.digitalChannels == Array(0...7))
+    }
+
+    @Test("A file that will not load fails without closing anything")
+    func loadFails() async {
+        let backend = FakeBackend(failing: [.load])
+        await #expect(throws: InjectedFault.self) { try await capture(backend, loadRequest) }
+        #expect(await backend.closedIDs.isEmpty)
+    }
+
+    @Test("Saving happens after capturing and before exporting")
+    func save() async throws {
+        var saving = request
+        saving.savePath = "/out.sal"
+        let backend = FakeBackend()
+        _ = try await capture(backend, saving)
+        #expect(await backend.calls == [.start, .wait, .save, .export, .close])
+        #expect(await backend.savedPath == "/out.sal")
+    }
+
+    @Test("A failed save is reported and the capture closed")
+    func saveFails() async {
+        var saving = request
+        saving.savePath = "/out.sal"
+        let backend = FakeBackend(failing: [.save])
+        let attempt = saving
+        await #expect(throws: InjectedFault.self) { try await capture(backend, attempt) }
+        #expect(await backend.closedIDs == [42])
+    }
+
+    @Test("A raw CSV export carries its settings")
+    func rawCSV() async throws {
+        var exporting = request
+        exporting.rawCSV = RawCSVExport(directory: "/csv", iso8601: true)
+        let backend = FakeBackend()
+        _ = try await capture(backend, exporting)
+        let raw = try #require(await backend.rawCSVRequest)
+        #expect(raw.captureID == 42)
+        #expect(raw.directory == "/csv")
+        #expect(raw.iso8601Timestamp)
+        #expect(raw.analogDownsampleRatio == 1)
+        #expect(raw.logicChannels.digitalChannels == Array(0...7))
+        #expect(await backend.calls == [.start, .wait, .rawCSV, .export, .close])
+    }
+
+    @Test("A raw CSV export of a loaded capture covers every channel")
+    func rawCSVLoaded() async throws {
+        var exporting = loadRequest
+        exporting.rawCSV = RawCSVExport(directory: "/csv", iso8601: false)
+        let backend = FakeBackend()
+        _ = try await capture(backend, exporting)
+        #expect(await backend.rawCSVRequest?.channels == nil)
+    }
+
+    @Test("A high level analyzer gets the decoder's id and its rows are what is read")
+    func highLevel() async throws {
+        var hla = uartDecode
+        hla.highLevel = HighLevelRequest(
+            extensionDirectory: "/ext", name: "Tagger",
+            settings: [HighLevelSetting(key: "a", value: .text("b")), HighLevelSetting(key: "c", value: .number(2))])
+        let backend = FakeBackend()
+        _ = try await decode(backend, hla)
+        let add = try #require(await backend.highLevelRequest)
+        #expect(add.captureID == 42)
+        #expect(add.extensionDirectory == "/ext")
+        #expect(add.hlaName == "Tagger")
+        #expect(add.inputAnalyzerID == 7)
+        #expect(add.settings["a"]?.stringValue == "b")
+        #expect(add.settings["c"]?.numberValue == 2)
+        #expect(await backend.tableRequest?.analyzers.map(\.analyzerID) == [9])
+        #expect(await backend.calls == [.start, .wait, .analyzer, .highLevel, .table, .close])
+    }
+
+    @Test("A table export is a second export, with Logic 2's options, and leaves the rows alone")
+    func tableExport() async throws {
+        var exporting = uartDecode
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("sal-\(UUID().uuidString).csv")
+        defer { try? FileManager.default.removeItem(at: file) }
+        exporting.tableExport = TableExport(
+            path: file.path, iso8601: true, columns: ["data"], filterQuery: "0x41", filterColumns: ["data"])
+        let backend = FakeBackend()
+        let rows = try await decode(backend, exporting)
+        #expect(rows.count == 1)
+        let tables = await backend.tableRequests
+        #expect(tables.count == 2)
+        #expect(!tables[0].iso8601Timestamp)
+        #expect(tables[0].exportColumns.isEmpty)
+        #expect(tables[1].filepath == file.path)
+        #expect(tables[1].iso8601Timestamp)
+        #expect(tables[1].exportColumns == ["data"])
+        #expect(tables[1].filter.query == "0x41")
+        #expect(tables[1].filter.columns == ["data"])
+    }
+
+    @Test("A table export with no filter sends none")
+    func tableExportPlain() async throws {
+        var exporting = uartDecode
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("sal-\(UUID().uuidString).csv")
+        defer { try? FileManager.default.removeItem(at: file) }
+        exporting.tableExport = TableExport(path: file.path)
+        let backend = FakeBackend()
+        _ = try await decode(backend, exporting)
+        #expect(await backend.tableRequests.last?.hasFilter == false)
+    }
+
+    @Test("A legacy export names the decoder, even when a high level analyzer runs")
+    func legacy() async throws {
+        var exporting = uartDecode
+        exporting.legacyPath = "/legacy.txt"
+        exporting.highLevel = HighLevelRequest(extensionDirectory: "/ext", name: "Tagger")
+        let backend = FakeBackend()
+        _ = try await decode(backend, exporting)
+        let legacy = try #require(await backend.legacyRequest)
+        #expect(legacy.captureID == 42)
+        #expect(legacy.filepath == "/legacy.txt")
+        #expect(legacy.analyzerID == 7)
+        #expect(legacy.radixType == .decimal)
+    }
+
+    @Test("Every combination of failing file steps still closes the capture")
+    func everyCombination() async {
+        let steps: [Step] = [.highLevel, .rawCSV, .legacy, .save, .analyzer, .table, .close]
+        var exporting = uartDecode
+        exporting.highLevel = HighLevelRequest(extensionDirectory: "/ext", name: "Tagger")
+        exporting.legacyPath = "/legacy.txt"
+        exporting.capture.savePath = "/out.sal"
+        exporting.capture.rawCSV = RawCSVExport(directory: "/csv", iso8601: false)
+        for mask in 0..<(1 << steps.count) {
+            let failing = Set(steps.indices.filter { mask & (1 << $0) != 0 }.map { steps[$0] })
+            let backend = FakeBackend(failing: failing)
+            let attempt = exporting
+            let rows = try? await decode(backend, attempt)
+            #expect((rows != nil) == failing.isEmpty, "failing: \(failing)")
+            #expect(await backend.closedIDs == [42], "failing: \(failing)")
+        }
+    }
+
+    @Test("Identifying a loaded capture uses every exported channel")
+    func identifyLoaded() async throws {
+        let backend = FakeBackend()
+        let result = try await inTemporaryDirectory { directory in
+            try await exportIdentifiedCapture(
+                loadRequest, confirm: false, in: directory, using: backend, cancellation: CaptureCancellation())
+        }
+        #expect(result.buses.count == 3)
+        #expect(await backend.calls == [.load, .export, .close])
+    }
+
+    @Test("Exported channels are read from file names, and stray files are ignored")
+    func exportedNames() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("sal-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        for name in ["digital_7.bin", "digital_10.bin", "digital_2.bin", "analog_1.bin", "digital_x.bin", "notes.txt", "digital_3.csv"] {
+            try Data().write(to: directory.appendingPathComponent(name))
+        }
+        let found = try exportedChannels(in: directory)
+        #expect(found.digital == [2, 7, 10])
+        #expect(found.analog == [1])
     }
 }
 

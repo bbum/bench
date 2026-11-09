@@ -9,8 +9,8 @@ struct CaptureCommand: AsyncParsableCommand {
 
     @OptionGroup var capture: CaptureOptions
 
-    @Option(help: "Digital channels, such as 0-7 or 0,2,4, or none with --analog.")
-    var channels = "0-7"
+    @Option(help: "Digital channels, such as 0-7 or 0,2,4, or none with --analog. Defaults to 0-7, or all with --load.")
+    var channels: String?
 
     @Option(help: "Analog channels to record too, such as 0 or 0-3.")
     var analog: String?
@@ -20,6 +20,12 @@ struct CaptureCommand: AsyncParsableCommand {
 
     @Option(help: "Keep one analog sample in this many, from 1 to 1,000,000.")
     var analogDownsample: UInt64 = 1
+
+    @Option(help: "Also write Logic 2's raw sample CSV files to this existing directory.")
+    var exportCsv: String?
+
+    @Flag(help: "Use ISO 8601 timestamps in --export-csv.")
+    var iso8601 = false
 
     @Flag(help: "Print JSON instead of a table.")
     var json = false
@@ -31,6 +37,7 @@ struct CaptureCommand: AsyncParsableCommand {
         guard channels != "none" || analog != nil else {
             throw ValidationError("--channels none needs --analog.")
         }
+        guard !iso8601 || exportCsv != nil else { throw ValidationError("--iso8601 needs --export-csv.") }
     }
 
     var analogCapture: AnalogCapture? {
@@ -45,9 +52,12 @@ struct CaptureCommand: AsyncParsableCommand {
 
     func run() async throws {
         let endpoint = capture.logic2.endpoint
-        let digital = channels == "none" ? [] : try parseChannelList(channels)
+        let digital = try resolvedChannels(channels, loading: capture.load != nil)
+        let rawCSV = exportCsv.map { RawCSVExport(directory: absolutePath($0), iso8601: iso8601) }
         let summary = try await capture.perform(channels: digital, analog: try analogCapture) { request in
-            try await runDigitalCapture(request, endpoint: endpoint)
+            var request = request
+            request.rawCSV = rawCSV
+            return try await runDigitalCapture(request, endpoint: endpoint)
         }
 
         if json {

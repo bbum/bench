@@ -174,10 +174,68 @@ enum ProtocolDecoder: Equatable, Sendable {
     }
 }
 
+/// A setting for a high level analyzer, written as `key=value`. Values that read as
+/// numbers are sent as numbers, because that is what number settings require.
+struct HighLevelSetting: ExpressibleByArgument, Equatable, Sendable {
+    enum Value: Equatable, Sendable {
+        case text(String)
+        case number(Double)
+    }
+
+    var key: String
+    var value: Value
+
+    init(key: String, value: Value) {
+        self.key = key
+        self.value = value
+    }
+
+    init?(argument: String) {
+        guard let separator = argument.firstIndex(of: "="), separator != argument.startIndex else { return nil }
+        let text = String(argument[argument.index(after: separator)...])
+        key = String(argument[..<separator])
+        if let number = Double(text), number.isFinite {
+            value = .number(number)
+        } else {
+            value = .text(text)
+        }
+    }
+
+    var wireValue: Saleae_Automation_HighLevelAnalyzerSettingValue {
+        var setting = Saleae_Automation_HighLevelAnalyzerSettingValue()
+        switch value {
+        case .text(let text): setting.stringValue = text
+        case .number(let number): setting.numberValue = number
+        }
+        return setting
+    }
+}
+
+/// A high level analyzer fed by the protocol decoder. Its rows replace the decoder's.
+struct HighLevelRequest: Equatable, Sendable {
+    /// The directory holding `extension.json`. Absolute.
+    var extensionDirectory: String
+    var name: String
+    var settings: [HighLevelSetting] = []
+}
+
+/// A data table written to a file for the user, with Logic 2's export options.
+struct TableExport: Equatable, Sendable {
+    var path: String
+    var iso8601 = false
+    var columns: [String] = []
+    var filterQuery: String?
+    var filterColumns: [String] = []
+}
+
 struct DecodeRequest: Sendable {
     var capture: DigitalCaptureRequest
     var decoder: ProtocolDecoder
     var radix = Radix.hex
+    var highLevel: HighLevelRequest?
+    var tableExport: TableExport?
+    /// Absolute path for Logic 2's older analyzer text export.
+    var legacyPath: String?
 }
 
 extension ProtocolDecoder {

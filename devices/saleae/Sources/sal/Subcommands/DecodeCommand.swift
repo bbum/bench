@@ -24,16 +24,72 @@ struct DecodeOptions: ParsableArguments {
     @Flag(help: "Print JSON instead of a table.")
     var json = false
 
+    @Option(help: "High level analyzer to run on the decoded data, as named in extension.json.")
+    var hla: String?
+
+    @Option(help: "Directory holding the high level analyzer's extension.json.")
+    var hlaExtension: String?
+
+    @Option(help: "Setting for the high level analyzer, as key=value. Repeatable.")
+    var hlaSetting: [HighLevelSetting] = []
+
+    @Option(help: "Also write Logic 2's data table CSV to this file.")
+    var exportTable: String?
+
+    @Flag(help: "Use ISO 8601 timestamps in --export-table.")
+    var iso8601 = false
+
+    @Option(help: "Columns for --export-table, comma separated.")
+    var columns: String?
+
+    @Option(help: "Only rows matching this text in --export-table.")
+    var filter: String?
+
+    @Option(help: "Columns --filter searches, comma separated. Defaults to all.")
+    var filterColumns: String?
+
+    @Option(help: "Also write Logic 2's older text export for the decoder to this file.")
+    var exportLegacy: String?
+
     func validate() throws {
+        guard (hla == nil) == (hlaExtension == nil) else {
+            throw ValidationError("--hla and --hla-extension go together.")
+        }
+        guard hla != nil || hlaSetting.isEmpty else { throw ValidationError("--hla-setting needs --hla.") }
+        guard exportTable != nil || (!iso8601 && columns == nil && filter == nil) else {
+            throw ValidationError("--iso8601, --columns and --filter need --export-table.")
+        }
+        guard filter != nil || filterColumns == nil else { throw ValidationError("--filter-columns needs --filter.") }
         guard offset >= 0 else { throw ValidationError("Offset cannot be negative.") }
         guard limit > 0 else { throw ValidationError("Limit must be positive.") }
     }
 
+    var highLevelRequest: HighLevelRequest? {
+        guard let hla, let hlaExtension else { return nil }
+        return HighLevelRequest(extensionDirectory: absolutePath(hlaExtension), name: hla, settings: hlaSetting)
+    }
+
+    var tableExportRequest: TableExport? {
+        exportTable.map {
+            func list(_ text: String?) -> [String] { text?.split(separator: ",").map(String.init) ?? [] }
+            return TableExport(
+                path: absolutePath($0), iso8601: iso8601, columns: list(columns), filterQuery: filter,
+                filterColumns: list(filterColumns))
+        }
+    }
+
     func run(_ decoder: ProtocolDecoder) async throws {
         let radix = radix
+        let highLevel = highLevelRequest
+        let tableExport = tableExportRequest
+        let legacyPath = exportLegacy.map(absolutePath)
         let endpoint = capture.logic2.endpoint
         let rows = try await capture.perform(channels: decoder.channels) { request in
-            try await runDecode(DecodeRequest(capture: request, decoder: decoder, radix: radix), endpoint: endpoint)
+            try await runDecode(
+                DecodeRequest(
+                    capture: request, decoder: decoder, radix: radix, highLevel: highLevel, tableExport: tableExport,
+                    legacyPath: legacyPath),
+                endpoint: endpoint)
         }
         let page = decodePage(rows, offset: offset, limit: limit)
 
