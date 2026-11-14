@@ -1,11 +1,13 @@
-# Known-answer signal generator firmware. The toolchain installs under ./arduino/.
+# Known-answer signal generator firmware for an ESP32-S3 DevKitC-1, flashed and driven
+# over its native USB port. The toolchain installs under ./arduino/.
 
-CORE_VERSION := 3.1.2
-FQBN := esp8266:esp8266:nodemcuv2:baud=460800,eesz=4M
+CORE_VERSION := 3.3.8
+FQBN := esp32:esp32:esp32s3:USBMode=hwcdc,CDCOnBoot=cdc,CPUFreq=240,UploadSpeed=921600
 BUILD_DIR := build
 
-# Only matches the CP2102 bridge, never an Espressif native-USB board.
-PORT ?= $(firstword $(wildcard /dev/cu.usbserial*))
+# ./port finds the board by its USB serial number, so the knob or any other Espressif
+# board on the bus is never touched.
+PORT ?= $(shell ./port)
 CONFIG := $(CURDIR)/arduino-cli.yaml
 ACLI := arduino-cli --config-file "$(CONFIG)"
 
@@ -13,12 +15,13 @@ ACLI := arduino-cli --config-file "$(CONFIG)"
 
 setup:
 	$(ACLI) core update-index
-	$(ACLI) core install esp8266:esp8266@$(CORE_VERSION)
+	$(ACLI) core install esp32:esp32@$(CORE_VERSION)
 
 build:
 	$(ACLI) compile --fqbn "$(FQBN)" --build-path "$(CURDIR)/$(BUILD_DIR)" .
 
 flash: build
+	@test -n "$(PORT)" || { echo "testgen not found; see README.md, or pass PORT=/dev/cu..."; exit 1; }
 	$(ACLI) upload --fqbn "$(FQBN)" --port "$(PORT)" --input-dir "$(CURDIR)/$(BUILD_DIR)" .
 
 monitor:

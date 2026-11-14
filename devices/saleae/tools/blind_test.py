@@ -204,10 +204,11 @@ def checkup(sal, run):
 
 class Board:
     def __init__(self):
-        names = sorted(n for n in os.listdir("/dev") if n.startswith("cu.usbserial"))
-        if not names:
-            sys.exit("No testgen USB serial port found.")
-        self.fd = os.open(f"/dev/{names[0]}", os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        finder = pathlib.Path(__file__).resolve().parent.parent / "testgen" / "port"
+        port = subprocess.run([finder], capture_output=True, text=True).stdout.strip()
+        if not port:
+            sys.exit("No testgen board found. See testgen/README.md.")
+        self.fd = os.open(port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         attrs = termios.tcgetattr(self.fd)
         attrs[0] = attrs[1] = attrs[3] = 0
         attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL

@@ -1,23 +1,33 @@
 # testgen
 
-ESP8266 firmware that loops over fixed traffic, so a capture can be checked against
-exactly what was sent. Logic level is 3.3 V. Board labels are for NodeMCU and D1 mini.
+ESP32-S3 firmware that loops over fixed traffic, so a capture can be checked against
+exactly what was sent. Logic level is 3.3 V. The board is an ESP32-S3 DevKitC-1 (clone),
+plugged in by the port labelled USB, the native one, not COM. Its RGB LED breathes through
+the colours while it runs. The ESP8266 version is in git history before firmware v6.
 
 ```
 make setup    # one time, installs the toolchain under ./arduino/
 make flash
 ```
 
-| Channel | Signal   | GPIO | Label | Expected                                  |
-|---------|----------|------|-------|-------------------------------------------|
-| 0       | PWM      | 12   | D6    | 1 kHz, 25% duty, software-timed           |
-| 1       | Sync     | 16   | D0    | 13-18 us high at the start of each cycle  |
-| 2       | UART TX  | 2    | D4    | `TESTGEN UART\n`, 115200 8N1              |
-| 3       | SPI CLK  | 14   | D5    | 1 MHz, mode 0, MSB first                  |
-| 4       | SPI MOSI | 13   | D7    | `A5 5A 00 FF 12 34`                       |
-| 5       | SPI CS   | 15   | D8    | Active low around the frame               |
-| 6       | I2C SDA  | 4    | D2    | Write to `0x42`: `DE AD BE EF`, all ACKed |
-| 7       | I2C SCL  | 5    | D1    | About 55 kHz, bit-banged                  |
+`./port` finds the board by its USB serial number, which is its MAC, so other Espressif
+boards such as the knob are never opened. A new board's MAC goes in `boards`. The ROM
+shows it as soon as the board is in download mode. A board running other firmware may need
+BOOT held while RST is tapped for its first flash, and then RST alone afterwards.
+
+All eight channels are side by side on the left header (USB ports at the bottom), from
+the fourth pin down. Connect a Logic ground to any GND pin.
+
+| Channel | Signal   | GPIO | Expected                                  |
+|---------|----------|------|-------------------------------------------|
+| 0       | PWM      | 4    | 1 kHz, 25% duty, hardware LEDC            |
+| 1       | Sync     | 5    | 13-18 us high at the start of each cycle   |
+| 2       | UART TX  | 6    | `TESTGEN UART\n`, 115200 8N1              |
+| 3       | SPI CLK  | 7    | 1 MHz, mode 0, MSB first                  |
+| 4       | SPI MOSI | 15   | `A5 5A 00 FF 12 34`                       |
+| 5       | SPI CS   | 16   | Active low around the frame               |
+| 6       | I2C SDA  | 17   | Write to `0x42`: `DE AD BE EF`, all ACKed |
+| 7       | I2C SCL  | 18   | Bit-banged, 5 us half periods plus overhead |
 
 Each cycle sends sync, UART, SPI, then I2C, followed by a 20 ms gap. The firmware
 drives the I2C ACK bits itself because the bus has no receiver.
@@ -85,5 +95,6 @@ peripheral. `SETUPUS` is how long the enable is asserted before the clock starts
 `PAUSEUS` an idle stretch between bytes. MISO sends `REPLYHEX`, and with `RELEASED` it is
 driven low while enabled and high otherwise, like a line let go to a pull-up. I2C's SDA
 changes a quarter of a half period after SCL falls, at most 1 us. Noise is drawn afresh
-each cycle. PWM runs from the waveform generator throughout, and its interrupt cannot be
-masked, so it delays the odd edge of everything else by up to 8 us.
+each cycle. PWM runs from the LEDC hardware throughout and disturbs nothing else. Interrupts come
+back on whenever the next edge is over 1 ms away, because the interrupt watchdog would
+fire after 300 ms without them.

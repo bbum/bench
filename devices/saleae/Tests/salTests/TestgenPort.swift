@@ -12,12 +12,9 @@ func withTestgen<Result>(mode: Character, body: () async throws -> Result) async
 
 /// As `withTestgen`, also passing `body` what the board replied when selecting the mode.
 func withTestgenReply<Result>(mode: Character, body: (String) async throws -> Result) async throws -> Result {
-    let names = try FileManager.default.contentsOfDirectory(atPath: "/dev")
-    guard let name = names.filter({ $0.hasPrefix("cu.usbserial") }).sorted().first else {
-        throw TestgenPortError(description: "No testgen USB serial port found")
-    }
-    let descriptor = open("/dev/" + name, O_RDWR | O_NOCTTY | O_NONBLOCK)
-    guard descriptor >= 0 else { throw TestgenPortError(description: "Cannot open /dev/\(name)") }
+    let path = try testgenPortPath()
+    let descriptor = open(path, O_RDWR | O_NOCTTY | O_NONBLOCK)
+    guard descriptor >= 0 else { throw TestgenPortError(description: "Cannot open \(path)") }
     defer { close(descriptor) }
 
     var options = termios()
@@ -59,4 +56,23 @@ func withTestgenReply<Result>(mode: Character, body: (String) async throws -> Re
     usleep(100_000)
     defer { try? select("c") }
     return try await body(reply)
+}
+
+/// Asks testgen/port, which finds the board by USB serial number and never opens any other.
+func testgenPortPath() throws -> String {
+    let script = URL(filePath: #filePath)
+        .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        .appending(path: "testgen/port")
+    let process = Process()
+    process.executableURL = script
+    let output = Pipe()
+    process.standardOutput = output
+    try process.run()
+    let data = output.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    let path = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !path.isEmpty else {
+        throw TestgenPortError(description: "No testgen board found. See testgen/README.md.")
+    }
+    return path
 }

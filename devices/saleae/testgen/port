@@ -1,0 +1,14 @@
+#!/bin/sh
+# Prints the testgen board's serial port, or nothing. TESTGEN_PORT overrides. Otherwise
+# the board is found by USB serial number, which for an ESP32-S3's native port is its MAC,
+# so other Espressif boards on the bus are never opened. Serial numbers are in ./boards.
+if [ -n "$TESTGEN_PORT" ]; then
+  echo "$TESTGEN_PORT"
+  exit 0
+fi
+boards="$(dirname "$0")/boards"
+ioreg -r -c IOUSBHostDevice -l -w0 | LC_ALL=C awk -F' = ' '
+  FNR == NR { sub(/#.*/, ""); gsub(/[ \t]/, ""); if ($0 != "") known[toupper($0)] = 1; next }
+  /"USB Serial Number" =/ { gsub(/"/, "", $2); serial = toupper($2) }
+  /"IOCalloutDevice" =/ { gsub(/"/, "", $2); if (serial in known) { print $2; exit } }
+' "$boards" -

@@ -1,0 +1,2 @@
+# USB serial numbers of testgen boards, one per line. See README.md.
+28:84:85:63:F0:68  # ESP32-S3 DevKitC-1 clone, bag L1309

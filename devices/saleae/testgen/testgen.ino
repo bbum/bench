@@ -1,23 +1,23 @@
 // Known-answer signal generator for Saleae bring-up. See README.md for the expected
-// capture. Targets a bare ESP8266 board with Wi-Fi off.
+// capture. Targets an ESP32-S3 DevKitC-1 board, with USB serial on the native port.
 
-#include <ESP8266WiFi.h>
 #include <SPI.h>
 #include <algorithm>
-#include <core_esp8266_waveform.h>
+#include <esp_random.h>
+#include <soc/gpio_reg.h>
 
-static const uint8_t PIN_PWM = 12;
-static const uint8_t PIN_SYNC = 16;
-static const uint8_t PIN_SDA = 4;
-static const uint8_t PIN_SCL = 5;
-static const uint8_t PIN_UART = 2;
-static const uint8_t SPI_PIN_CLK = 14;
-static const uint8_t SPI_PIN_MOSI = 13;
-static const uint8_t SPI_PIN_CS = 15;
+// Channels 0 to 7 are these GPIOs, which sit side by side on the DevKitC-1's left header.
+static const uint8_t PIN_PWM = 4;
+static const uint8_t PIN_SYNC = 5;
+static const uint8_t PIN_UART = 6;
+static const uint8_t SPI_PIN_CLK = 7;
+static const uint8_t SPI_PIN_MOSI = 15;
+static const uint8_t SPI_PIN_CS = 16;
+static const uint8_t PIN_SDA = 17;
+static const uint8_t PIN_SCL = 18;
 
 static const char UART_MESSAGE[] = "TESTGEN UART\n";
-// SPIClass::writeBytes reads 32-bit words, so this must be aligned.
-alignas(4) static const uint8_t SPI_FRAME[] = {0xA5, 0x5A, 0x00, 0xFF, 0x12, 0x34};
+static const uint8_t SPI_FRAME[] = {0xA5, 0x5A, 0x00, 0xFF, 0x12, 0x34};
 static const uint8_t I2C_ADDRESS = 0x42;
 static const uint8_t I2C_FRAME[] = {0xDE, 0xAD, 0xBE, 0xEF};
 
@@ -73,8 +73,8 @@ struct ScenarioSignal {
 // One change of pin levels, at a time counted in CPU cycles from the start of a cycle.
 struct ScheduledEdge {
   uint32_t at;
-  uint16_t set;
-  uint16_t clear;
+  uint32_t set;
+  uint32_t clear;
 };
 
 static const UartFormat FORMAT_8N1 = {8, 'N', 2, false, false};
@@ -159,7 +159,11 @@ static void sendI2CWithNacks() {
   i2cStop();
 }
 
+// Fields of the S3's SPI_CLOCK register: prescale - 1, period - 1, high ticks - 1, period - 1.
+static const uint32_t SPI_CLOCK_1MHZ = (1UL << 18) | (39UL << 12) | (19UL << 6) | 39UL;
+
 static void sendSPI() {
+  // Keeps the divider set in useHardwarePeripherals, because that is also 1 MHz.
   SPI.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
   SPI.writeBytes(SPI_FRAME, sizeof(SPI_FRAME));
   SPI.endTransaction();
@@ -175,13 +179,7 @@ static void sendUART() {
 static uint8_t uartActivePin = PIN_UART;
 
 static void IRAM_ATTR uartPin(bool high) {
-  if (uartActivePin == 16) {
-    GP16O = high ? 1 : 0;
-  } else if (high) {
-    GPOS = 1 << uartActivePin;
-  } else {
-    GPOC = 1 << uartActivePin;
-  }
+  REG_WRITE(high ? GPIO_OUT_W1TS_REG : GPIO_OUT_W1TC_REG, 1UL << uartActivePin);
 }
 
 static void IRAM_ATTR uartLevel(const UartFormat &format, bool level, uint32_t &deadline, uint32_t cycles) {
@@ -276,10 +274,44 @@ static void sendVariantSPI(const SpiFormat &format) {
   digitalWrite(SPI_PIN_CS, format.csActiveHigh ? LOW : HIGH);
 }
 
+// Pins 0 to 31 share one set of output registers, so a single write moves several at once.
+static uint32_t pwmPins = 0;
+
+// LEDC is hardware, so unlike the ESP8266's waveform interrupt it never delays other edges.
+static void startPwm(uint8_t pin, uint32_t hz, uint32_t dutyPercent) {
+  uint8_t bits = 14;
+  while (bits > 1 && (static_cast<uint64_t>(hz) << bits) > 40000000ULL) {
+    bits--;
+  }
+  if (ledcAttach(pin, hz, bits)) {
+    ledcWrite(pin, (static_cast<uint32_t>(1) << bits) * std::min<uint32_t>(dutyPercent, 100) / 100);
+    pwmPins |= 1UL << pin;
+  }
+}
+
+static void stopPwm(uint8_t pin) {
+  if (pwmPins & (1UL << pin)) {
+    ledcDetach(pin);
+    pwmPins &= ~(1UL << pin);
+  }
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, LOW);
+}
+
+static void stopHardwarePeripherals() {
+  SPI.end();
+  Serial1.end();
+}
+
 static void useHardwarePeripherals() {
-  Serial1.begin(115200);
-  SPI.begin();
+  stopHardwarePeripherals();
+  Serial1.begin(115200, SERIAL_8N1, -1, PIN_UART);
+  SPI.begin(SPI_PIN_CLK, -1, SPI_PIN_MOSI, SPI_PIN_CS);
   SPI.setHwCs(true);
+  // The core's own 1 MHz divider is a 2 tick period behind a /40 prescaler, which comes
+  // out 600 ns high and 400 ns low. This is /2, then 40 ticks with 20 high. It must be set
+  // outside a transaction, which holds the bus lock this takes.
+  SPI.setClockDivider(SPI_CLOCK_1MHZ);
   activeVariant = nullptr;
 }
 
@@ -290,7 +322,7 @@ static void useHardwarePeripherals() {
 // Every signal's edges go onto one timeline, which is then played back against the CPU
 // cycle counter with interrupts off. That is what lets signals overlap, and it makes
 // their timing exact to a fraction of a microsecond.
-static const uint8_t CHANNEL_PINS[8] = {12, 16, 2, 14, 13, 15, 4, 5};
+static const uint8_t CHANNEL_PINS[8] = {PIN_PWM, PIN_SYNC, PIN_UART, SPI_PIN_CLK, SPI_PIN_MOSI, SPI_PIN_CS, PIN_SDA, PIN_SCL};
 static const uint8_t MAX_SCENARIO_SIGNALS = 8;
 static ScenarioSignal scenario[MAX_SCENARIO_SIGNALS];
 static uint8_t scenarioCount = 0;
@@ -304,11 +336,8 @@ static bool edgesOverflowed = false;
 // Noise is drawn afresh each cycle, so a scenario with any is scheduled again each time.
 static bool scenarioHasNoise = false;
 
-// GPIO16 has a register of its own. GPIO0 carries no channel, so its bit stands in.
-static const uint16_t GPIO16_BIT = 1;
-
-static uint16_t pinBit(uint8_t pin) {
-  return pin == 16 ? GPIO16_BIT : static_cast<uint16_t>(1 << pin);
+static uint32_t pinBit(uint8_t pin) {
+  return 1UL << pin;
 }
 
 static void addEdge(uint32_t at, uint8_t pin, bool high) {
@@ -324,9 +353,7 @@ static void addEdge(uint32_t at, uint8_t pin, bool high) {
 
 static void stopAllWaveforms() {
   for (uint8_t pin : CHANNEL_PINS) {
-    if (pin != 16) {
-      stopWaveform(pin);
-    }
+    stopPwm(pin);
   }
 }
 
@@ -441,7 +468,7 @@ static void scheduleNoise(const ScenarioSignal &signal) {
   for (uint32_t i = 0; i < signal.numberA; i++) {
     level = !level;
     addEdge(at, signal.pinA, level);
-    at += (1 + ESP.random() % signal.numberB) * CYCLES_PER_US;
+    at += (1 + esp_random() % signal.numberB) * CYCLES_PER_US;
   }
   addEdge(at, signal.pinA, signal.flagA);
 }
@@ -476,26 +503,67 @@ static bool scheduleScenario() {
   return !edgesOverflowed;
 }
 
+// The interrupt watchdog fires if this core holds interrupts off for 300 ms, so they come
+// back on whenever the next edge is more than this far off. Every edge, and everything up
+// to a millisecond before it, is still played with them off.
+static const uint32_t OPEN_WINDOW_CYCLES = 1000 * CYCLES_PER_US;
+
 // Runs from RAM, because a flash fetch would be late enough to move an edge.
 static void IRAM_ATTR playEdges() {
   noInterrupts();
+  bool masked = true;
   const uint32_t start = ESP.getCycleCount();
   for (uint16_t i = 0; i < edgeCount; i++) {
     const ScheduledEdge &edge = edges[i];
-    while (static_cast<int32_t>(ESP.getCycleCount() - start - edge.at) < 0) {
+    for (;;) {
+      const int32_t remaining = static_cast<int32_t>(edge.at - (ESP.getCycleCount() - start));
+      if (remaining <= 0) {
+        break;
+      }
+      if (remaining > static_cast<int32_t>(OPEN_WINDOW_CYCLES)) {
+        if (masked) {
+          interrupts();
+          masked = false;
+        }
+      } else if (!masked) {
+        noInterrupts();
+        masked = true;
+      }
     }
-    const uint16_t set = edge.set & ~GPIO16_BIT, clear = edge.clear & ~GPIO16_BIT;
-    if (set) {
-      GPOS = set;
+    if (edge.set) {
+      REG_WRITE(GPIO_OUT_W1TS_REG, edge.set);
     }
-    if (clear) {
-      GPOC = clear;
-    }
-    if ((edge.set | edge.clear) & GPIO16_BIT) {
-      GP16O = (edge.set & GPIO16_BIT) ? 1 : 0;
+    if (edge.clear) {
+      REG_WRITE(GPIO_OUT_W1TC_REG, edge.clear);
     }
   }
   interrupts();
+}
+
+// The DevKitC-1's addressable RGB LED, which is on GPIO38 on some revisions. It breathes
+// while hues drift round the wheel. It is only written in the gap between cycles, because
+// the write takes about 30 us.
+static const uint8_t LED_RGB_PIN = 48;
+static const uint8_t LED_BRIGHTEST = 40;
+static const float BREATH_SECONDS = 4.0f;
+static const float HUE_SECONDS = 20.0f;
+
+static void updateLed() {
+  const float seconds = millis() / 1000.0f;
+  const float breath = 0.5f - 0.5f * cosf(2.0f * PI * seconds / BREATH_SECONDS);
+  const float level = LED_BRIGHTEST * (0.05f + 0.95f * breath);
+  const float hue = fmodf(seconds / HUE_SECONDS, 1.0f) * 6.0f;
+  const float rise = hue - floorf(hue), fall = 1.0f - rise;
+  float r, g, b;
+  switch (static_cast<int>(hue)) {
+    case 0: r = 1; g = rise; b = 0; break;
+    case 1: r = fall; g = 1; b = 0; break;
+    case 2: r = 0; g = 1; b = rise; break;
+    case 3: r = 0; g = fall; b = 1; break;
+    case 4: r = rise; g = 0; b = 1; break;
+    default: r = 1; g = 0; b = fall; break;
+  }
+  rgbLedWrite(LED_RGB_PIN, r * level, g * level, b * level);
 }
 
 static void playScenario() {
@@ -503,6 +571,7 @@ static void playScenario() {
     scheduleScenario();
   }
   playEdges();
+  updateLed();
   delay(scenarioGapMs);
 }
 
@@ -607,6 +676,7 @@ static bool parseScenarioSignal(char *text, ScenarioSignal &signal) {
 }
 
 static void applyIdleLevels() {
+  stopHardwarePeripherals();
   for (uint8_t pin : CHANNEL_PINS) {
     pinMode(pin, OUTPUT);
     digitalWrite(pin, LOW);
@@ -637,9 +707,7 @@ static void applyIdleLevels() {
   for (uint8_t i = 0; i < scenarioCount; i++) {
     const ScenarioSignal &signal = scenario[i];
     if (signal.kind == 'w') {
-      uint32_t period = 1000000UL / signal.numberA;
-      uint32_t high = period * signal.numberB / 100;
-      startWaveform(signal.pinA, high, period - high, 0);
+      startPwm(signal.pinA, signal.numberA, signal.numberB);
     }
   }
 }
@@ -650,13 +718,16 @@ static void applyIdleLevels() {
 static void loadScenario() {
   Serial.println("ready");
   Serial.setTimeout(2000);
+  static char text[2048];
   String line = Serial.readStringUntil('\n');
-  char *text = line.begin();
+  bool fits = line.length() < sizeof(text);
+  strncpy(text, line.c_str(), sizeof(text) - 1);
+  text[sizeof(text) - 1] = 0;
   char *saved = nullptr;
   char *field = strtok_r(text, "|", &saved);
   uint32_t gap = field ? atol(field) : 20;
   uint8_t count = 0;
-  bool valid = field != nullptr;
+  bool valid = fits && field != nullptr;
   while (valid && (field = strtok_r(nullptr, "|", &saved)) != nullptr) {
     valid = count < MAX_SCENARIO_SIGNALS && parseScenarioSignal(field, scenario[count]);
     count++;
@@ -698,8 +769,9 @@ static void leaveScenario() {
 
 static void useVariant(const Variant &variant) {
   leaveScenario();
-  // The PWM interrupt cannot be masked and would disturb bit-banged timing.
-  analogWrite(PIN_PWM, 0);
+  // Modes other than c have always stopped the PWM, so captures of them stay the same.
+  stopHardwarePeripherals();
+  stopPwm(PIN_PWM);
   pinMode(PIN_UART, OUTPUT);
   digitalWrite(PIN_UART, variant.uart.inverted ? LOW : HIGH);
   pinMode(SPI_PIN_CLK, OUTPUT);
@@ -715,15 +787,15 @@ static void useVariant(const Variant &variant) {
 static void useRandomUart(bool fastest) {
   uint32_t baud = fastest
                       ? 921600
-                      : (ESP.random() & 1)
-                      ? STANDARD_BAUDS[ESP.random() % (sizeof(STANDARD_BAUDS) / sizeof(STANDARD_BAUDS[0]))]
-                      : static_cast<uint32_t>(2400.0 * pow(2.0, (ESP.random() % 770) / 100.0));
+                      : (esp_random() & 1)
+                      ? STANDARD_BAUDS[esp_random() % (sizeof(STANDARD_BAUDS) / sizeof(STANDARD_BAUDS[0]))]
+                      : static_cast<uint32_t>(2400.0 * pow(2.0, (esp_random() % 770) / 100.0));
   static const char PARITIES[] = {'N', 'E', 'O'};
-  randomVariant.uart.parity = PARITIES[ESP.random() % 3];
-  randomVariant.uart.stopHalves = (ESP.random() & 1) ? 4 : 2;
-  randomVariant.uart.inverted = ESP.random() & 1;
+  randomVariant.uart.parity = PARITIES[esp_random() % 3];
+  randomVariant.uart.stopHalves = (esp_random() & 1) ? 4 : 2;
+  randomVariant.uart.inverted = esp_random() & 1;
   for (uint8_t &value : randomPayload) {
-    value = ESP.random() & 0xFF;
+    value = esp_random() & 0xFF;
   }
   useVariant(randomVariant);
   uartBitCycles = F_CPU / baud;
@@ -746,9 +818,8 @@ static void handleCommands() {
     if (key == 'c') {
       leaveScenario();
       useHardwarePeripherals();
-      // SPI.begin() takes this pin for MISO, and analogWrite will not take it back.
-      pinMode(PIN_PWM, OUTPUT);
-      analogWrite(PIN_PWM, 250);
+      stopPwm(PIN_PWM);
+      startPwm(PIN_PWM, 1000, 25);
       Serial.println("mode c");
       continue;
     }
@@ -769,15 +840,13 @@ static void handleCommands() {
 }
 
 static void pulseSync() {
+  // 15 us keeps the ESP8266's documented 13 to 18 us, which tests and old captures expect.
   digitalWrite(PIN_SYNC, HIGH);
-  delayMicroseconds(10);
+  delayMicroseconds(15);
   digitalWrite(PIN_SYNC, LOW);
 }
 
 void setup() {
-  WiFi.mode(WIFI_OFF);
-  WiFi.forceSleepBegin();
-
   // Scenario lines arrive while traffic is being bit-banged with interrupts held off.
   Serial.setRxBufferSize(1024);
   Serial.begin(115200);
@@ -790,13 +859,10 @@ void setup() {
   digitalWrite(PIN_SCL, HIGH);
 
   useHardwarePeripherals();
-
-  analogWriteRange(1000);
-  analogWriteFreq(1000);
-  analogWrite(PIN_PWM, 250);
+  startPwm(PIN_PWM, 1000, 25);
 
   Serial.println();
-  Serial.println("testgen v5 running");
+  Serial.println("testgen v6 esp32s3 running");
 }
 
 void loop() {
@@ -819,5 +885,6 @@ void loop() {
       sendI2C();
     }
   }
+  updateLed();
   delay(CYCLE_GAP_MS);
 }

@@ -120,15 +120,17 @@ Tested the way SQLite is. New parsing or analysis code ships with all of these:
 - Binary exports: this Logic Pro 8 on Logic 2.4.48 produces format V0 (confirmed by
   capture). Saleae says the device will move to a chunked V1, so check the version
   field and reject anything unknown.
-- `testgen/` is an ESP8266 known-answer signal source. Its README has the wiring, the
-  expected values for each channel, and the modes selected over USB serial. Opening
-  the port usually resets the board and closing it does not, so tests select a mode
-  and restore clean mode.
+- `testgen/` is an ESP32-S3 known-answer signal source on its native USB port. Its README
+  has the wiring, the expected values for each channel, and the modes selected over USB
+  serial. `testgen/port` finds it by USB serial number (listed in `testgen/boards`),
+  because the knob is also an S3 on `usbmodem`. Never pick a port by name pattern. Tests
+  select a mode and restore clean mode.
 - Scenarios (`x`) play every signal from one scheduled timeline with interrupts off, so
   signals overlap and timing is exact. The host must wait for `ready` before sending
-  the line. PWM's unmaskable interrupt still delays the odd edge by up to 8 us, so
-  `blind_test.py` keeps UART at or under 57600 and SPI half periods at or over 5 us
-  when PWM is present.
+  the line. On the ESP8266, PWM's unmaskable interrupt delayed the odd edge by up to
+  8 us, so `blind_test.py` keeps UART at or under 57600 and SPI half periods at or over
+  5 us when PWM is present. The S3's PWM is hardware, so those limits can go once a
+  blind run on it confirms that.
 - Blind captures carry their answer key beside them (`run-S-N.json`). Replay reads the
   key, never the seed, so the generator can change without losing old captures.
   `.blind/seed-7` is the v4 firmware's sequential signals, `.blind/seed-12` v5's
