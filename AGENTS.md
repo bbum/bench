@@ -8,5 +8,6 @@ Each vendor directory is self-contained, with its own build and docs.
 |-------------------|---------------------------|-----------------------------------------------|
 | `devices/owon/`   | Owon SDS-series scopes    | Working `ow` CLI + MCP server. See its CLAUDE.md. |
 | `devices/saleae/` | Saleae logic analyzers    | Early `sal` CLI over Logic 2 gRPC. See its CLAUDE.md. |
+| `devices/fnirsi/` | FNIRSI FNB58 USB meter    | Working `fnb58` CLI + MCP server over USB HID. See its CLAUDE.md. |
 
 Run build and test commands from the vendor directory, not the repo root.
